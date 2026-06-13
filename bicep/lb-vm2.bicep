@@ -1,8 +1,8 @@
-// lb.bicep — Standard Load Balancer + VM 2-instance high-availability setup
+// lb-vm2.bicep — Standard Load Balancer + VM-2 (high-availability application tier)
 // Usage:
 //   az deployment group create \
 //     --resource-group ltmsa-security-rg \
-//     --template-file lb.bicep \
+//     --template-file lb-vm2.bicep \
 //     --parameters adminPassword="<password>" subnetId="<web-snet-id>"
 targetScope = 'resourceGroup'
 

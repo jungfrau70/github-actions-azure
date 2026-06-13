@@ -2,7 +2,7 @@
 #
 # Flow: CI (test) → CD (Bicep: LB + VM-2) → App deploy (VM-1 + VM-2) → LB verify
 #   - Azure login: AZURE_CREDENTIALS secret (Service Principal)
-#   - IaC: lb.bicep deploys Standard LB + VM-2
+#   - IaC: lb-vm2.bicep deploys Standard LB + VM-2
 #   - App deploy: az vm run-command invoke (no SSH — Zero Trust)
 #   - Process manager: pm2
 #   - Health check: /health endpoint via LB
@@ -14,7 +14,7 @@
 # Deploy targets:
 #   Resource Group: ltmsa-security-rg
 #   VM-1:           ltmsa-demo-vm   (existing)
-#   VM-2:           ltmsa-demo-vm-2 (created by lb.bicep)
+#   VM-2:           ltmsa-demo-vm-2 (created by lb-vm2.bicep)
 #   Load Balancer:  ltmsa-lb        (port 80 → 3000)
 #   App path:       /opt/ltm-workshop
 #   App port:       3000
@@ -106,16 +106,16 @@ jobs:
         run: |
           az deployment group what-if \
             --resource-group ${{ env.AZURE_RG }} \
-            --template-file bicep/lb.bicep \
+            --template-file bicep/lb-vm2.bicep \
             --parameters adminPassword="${{ secrets.ADMIN_PASSWORD }}" \
                          subnetId="${{ steps.subnet.outputs.subnet_id }}"
 
-      - name: Deploy lb.bicep
+      - name: Deploy lb-vm2.bicep
         id: bicep
         run: |
           RESULT=$(az deployment group create \
             --resource-group ${{ env.AZURE_RG }} \
-            --template-file bicep/lb.bicep \
+            --template-file bicep/lb-vm2.bicep \
             --parameters adminPassword="${{ secrets.ADMIN_PASSWORD }}" \
                          subnetId="${{ steps.subnet.outputs.subnet_id }}" \
             --query properties.outputs \

@@ -15,7 +15,7 @@
 #             Rationale: these are topology/security boundaries that rarely change.
 #             az CLI keeps them explicit, auditable line-by-line, and easy to debug.
 #
-#   Bicep   — reusable application-tier module (lb.bicep):
+#   Bicep   — reusable application-tier module (lb-vm2.bicep):
 #               Standard LB + VM-2 NIC + VM-2
 #             Rationale: the LB+VM bundle is a repeatable pattern that may be
 #             deployed multiple times (different regions, environments). Bicep
@@ -367,7 +367,7 @@ jobs:
         if: always()
         run: az logout
 
-  # ── 4. IaC: lb.bicep (LB + VM-2) ──────────────────────────────────
+  # ── 4. IaC: lb-vm2.bicep (LB + VM-2) ──────────────────────────────────
   setup-lb:
     name: "Step 4 — Bicep: LB + VM-2"
     runs-on: ubuntu-latest
@@ -383,12 +383,12 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy lb.bicep
+      - name: Deploy lb-vm2.bicep
         id: bicep
         run: |
           RESULT=$(az deployment group create \
             --resource-group ${{ env.AZURE_RG }} \
-            --template-file bicep/lb.bicep \
+            --template-file bicep/lb-vm2.bicep \
             --parameters adminPassword="${{ secrets.ADMIN_PASSWORD }}" \
                          subnetId="${{ needs.setup-network.outputs.subnet_id }}" \
             --query properties.outputs \
