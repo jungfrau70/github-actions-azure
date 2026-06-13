@@ -1,0 +1,102 @@
+# 🔒 .gitignore 파일
+# Git에서 추적하지 않을 파일들을 정의합니다
+
+# 의존성
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# 환경 변수
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# 로그
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# 런타임 데이터
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# 커버리지 디렉토리
+coverage/
+.nyc_output/
+.coverage/
+
+# 빌드 결과물
+dist/
+build/
+out/
+
+# 캐시
+.cache/
+.parcel-cache/
+.eslintcache
+.jest-cache/
+
+# IDE 설정
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS 생성 파일
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# 테스트 결과
+test-results/
+playwright-report/
+test-results.xml
+
+# 임시 파일
+*.tmp
+*.temp
+.tmp/
+.temp/
+
+# 백업 파일
+*.bak
+*.backup
+*.old
+
+# 압축 파일
+*.zip
+*.tar.gz
+*.rar
+
+# 데이터베이스
+*.db
+*.sqlite
+*.sqlite3
+
+# 인증서
+*.pem
+*.key
+*.crt
+*.p12
+
+# 기타
+.env.example
+docker-compose.override.yml

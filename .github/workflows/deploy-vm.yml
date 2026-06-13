@@ -1,0 +1,221 @@
+# 🚀 LTM Korea Azure SA Workshop — VM 배포 워크플로우 (실습 7.4)
+#
+# 흐름: CI(테스트) → CD(Azure VM 배포)
+#   - Azure 로그인: AZURE_CREDENTIALS secret (Service Principal)
+#   - VM 배포: az vm run-command invoke (SSH 포트 불필요 — Zero Trust)
+#   - 프로세스 관리: pm2 (재시작 후에도 자동 복구)
+#   - 헬스 체크: /health 엔드포인트 확인
+#
+# 필요한 GitHub Secrets:
+#   AZURE_CREDENTIALS  — az ad sp create-for-rbac --sdk-auth 출력 JSON 전체
+#
+# 배포 대상:
+#   리소스 그룹: ltmsa-security-rg
+#   VM:          ltmsa-demo-vm  (Korea Central, Ubuntu 22.04)
+#   앱 경로:     /opt/ltm-workshop
+#   포트:        3000 (NSG allow-app-3000 규칙으로 허용)
+
+name: Deploy to Azure VM
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '배포 환경'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [ dev, staging, production ]
+
+env:
+  AZURE_RG:   ltmsa-security-rg
+  AZURE_VM:   ltmsa-demo-vm
+  APP_DIR:    /opt/ltm-workshop
+  APP_PORT:   3000
+  NODE_VER:   "18"
+
+jobs:
+  # ── 1. CI ──────────────────────────────────────────────────────────
+  ci:
+    name: "CI — Test & Lint"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Node.js 설정
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VER }}
+          cache: npm
+
+      - name: 의존성 설치
+        run: npm ci
+
+      - name: 단위 테스트
+        run: npm run test:unit
+
+      - name: 앱 구문 확인
+        run: node -e "require('./src/app.js'); console.log('syntax OK')"
+
+  # ── 2. CD ──────────────────────────────────────────────────────────
+  deploy:
+    name: "CD — Azure VM 배포"
+    runs-on: ubuntu-latest
+    needs: ci
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Azure 로그인 (Service Principal)
+      - name: Azure 로그인
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # VM 실행 상태 확인 — 중지 시 자동 시작
+      - name: VM 상태 확인
+        run: |
+          STATE=$(az vm get-instance-view \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_VM }} \
+            --query "instanceView.statuses[?starts_with(code,'PowerState')].displayStatus" \
+            --output tsv)
+          echo "VM 상태: $STATE"
+          if [[ "$STATE" != "VM running" ]]; then
+            echo "VM 시작 중..."
+            az vm start --resource-group ${{ env.AZURE_RG }} --name ${{ env.AZURE_VM }}
+          fi
+
+      # 앱 파일을 base64로 인코딩하여 VM에 전달
+      - name: 배포 패키지 준비
+        id: pkg
+        run: |
+          APP_B64=$(base64 -w0 src/app.js)
+          PKG_B64=$(base64 -w0 package.json)
+          echo "app_b64=$APP_B64" >> $GITHUB_OUTPUT
+          echo "pkg_b64=$PKG_B64" >> $GITHUB_OUTPUT
+          echo "app_version=$(node -p "require('./package.json').version")-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      # VM에 배포 (az vm run-command — SSH 불필요)
+      - name: VM 배포 실행
+        run: |
+          APP_VERSION="${{ steps.pkg.outputs.app_version }}"
+          APP_B64="${{ steps.pkg.outputs.app_b64 }}"
+          PKG_B64="${{ steps.pkg.outputs.pkg_b64 }}"
+          APP_DIR="${{ env.APP_DIR }}"
+          APP_PORT="${{ env.APP_PORT }}"
+          NODE_ENV="${{ github.event.inputs.environment || 'dev' }}"
+
+          az vm run-command invoke \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_VM }} \
+            --command-id RunShellScript \
+            --scripts "
+              set -e
+              echo '=== LTM Azure SA Workshop 배포 시작 ==='
+
+              # Node.js 설치 확인
+              if ! command -v node &>/dev/null; then
+                echo 'Node.js 설치 중...'
+                curl -fsSL https://deb.nodesource.com/setup_${NODE_VER}.x | sudo -E bash - >/dev/null
+                sudo apt-get install -y nodejs >/dev/null
+              fi
+              echo \"Node.js: \$(node --version)  npm: \$(npm --version)\"
+
+              # pm2 설치 확인
+              if ! command -v pm2 &>/dev/null; then
+                echo 'pm2 설치 중...'
+                sudo npm install -g pm2 >/dev/null 2>&1
+              fi
+              echo \"pm2: \$(pm2 --version)\"
+
+              # 앱 디렉토리 준비
+              sudo mkdir -p ${APP_DIR}
+              sudo chown azureuser:azureuser ${APP_DIR}
+              cd ${APP_DIR}
+
+              # 앱 파일 배포
+              echo '${APP_B64}' | base64 -d > app.js
+              echo '${PKG_B64}' | base64 -d > package.json
+
+              # 의존성 설치 (프로덕션만)
+              npm install --production --silent
+              echo '의존성 설치 완료'
+
+              # pm2로 앱 시작/재시작
+              if pm2 describe ltm-workshop &>/dev/null; then
+                pm2 restart ltm-workshop --update-env
+              else
+                PORT=${APP_PORT} NODE_ENV=${NODE_ENV} APP_VERSION=${APP_VERSION} \
+                  pm2 start app.js --name ltm-workshop
+              fi
+
+              # pm2 부팅 자동 시작 등록
+              pm2 save --force >/dev/null
+
+              # 헬스 체크 (최대 30초 대기)
+              echo '헬스 체크 중...'
+              for i in \$(seq 1 6); do
+                sleep 5
+                if curl -sf http://localhost:${APP_PORT}/health >/dev/null; then
+                  echo \"=== 배포 성공! (시도 \${i}/6) ===\"
+                  curl -s http://localhost:${APP_PORT}/health
+                  pm2 status ltm-workshop
+                  exit 0
+                fi
+                echo \"대기 중... (\${i}/6)\"
+              done
+              echo '헬스 체크 실패'
+              pm2 logs ltm-workshop --lines 20 --nostream || true
+              exit 1
+            " \
+            --query "value[0].message" \
+            --output tsv
+
+      # 배포 결과 요약
+      - name: 배포 결과
+        if: success()
+        run: |
+          VM_IP=$(az vm show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_VM }} \
+            --show-details \
+            --query publicIps \
+            --output tsv)
+
+          echo ""
+          echo "=================================================="
+          echo "  ✅  배포 완료"
+          echo "=================================================="
+          echo "  앱 URL  : http://${VM_IP}:${{ env.APP_PORT }}"
+          echo "  버전    : ${{ steps.pkg.outputs.app_version }}"
+          echo "  환경    : ${{ github.event.inputs.environment || 'dev' }}"
+          echo "  커밋    : ${{ github.sha }}"
+          echo "=================================================="
+
+          echo "### ✅ 배포 완료" >> $GITHUB_STEP_SUMMARY
+          echo "| 항목 | 값 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 앱 URL | http://${VM_IP}:${{ env.APP_PORT }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 버전 | ${{ steps.pkg.outputs.app_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 커밋 | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      # 외부에서 앱 응답 확인
+      - name: 외부 접근 확인
+        if: success()
+        run: |
+          VM_IP=$(az vm show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_VM }} \
+            --show-details \
+            --query publicIps \
+            --output tsv)
+          echo "외부 헬스 체크: http://${VM_IP}:${{ env.APP_PORT }}/health"
+          curl -sf "http://${VM_IP}:${{ env.APP_PORT }}/health" | python3 -m json.tool
+
+      - name: Azure 로그아웃
+        if: always()
+        run: az logout
