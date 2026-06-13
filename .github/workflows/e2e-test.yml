@@ -8,7 +8,24 @@
 #   3. Jumpbox pattern enables internal VM-to-VM management
 #   4. Break-glass: az vm run-command bypasses network restrictions via Management Plane
 #
-# Required GitHub Secrets:
+# ── Infrastructure provisioning strategy (hybrid) ───────────────────────────
+#
+#   az CLI  — one-time, environment-scoped resources (created once per environment):
+#               RG, VNet, NSG, Bastion, Jumpbox VM, VM-1
+#             Rationale: these are topology/security boundaries that rarely change.
+#             az CLI keeps them explicit, auditable line-by-line, and easy to debug.
+#
+#   Bicep   — reusable application-tier module (lb.bicep):
+#               Standard LB + VM-2 NIC + VM-2
+#             Rationale: the LB+VM bundle is a repeatable pattern that may be
+#             deployed multiple times (different regions, environments). Bicep
+#             provides idempotency (what-if), parameter typing, and output contracts.
+#
+#   This split mirrors real-world practice:
+#     "Network/security topology → CLI or Portal (ops team owns it)"
+#     "Application-tier IaC module → Bicep/Terraform (dev team re-uses it)"
+#
+# ── Required GitHub Secrets ─────────────────────────────────────────────────
 #   AZURE_CREDENTIALS  — az ad sp create-for-rbac --sdk-auth JSON
 #   ADMIN_PASSWORD     — VM admin password
 #
