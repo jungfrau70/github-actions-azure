@@ -537,7 +537,7 @@ jobs:
           echo "Waiting for LB at http://${LB_IP}/health ..."
           for i in $(seq 1 18); do
             sleep 10
-            if curl -sf "http://${LB_IP}/health" >/dev/null 2>&1; then
+            if curl -sf --max-time 10 "http://${LB_IP}/health" >/dev/null 2>&1; then
               echo "LB is healthy (attempt ${i}/18)"
               break
             fi
