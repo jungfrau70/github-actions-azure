@@ -496,6 +496,12 @@ jobs:
                   pm2 start app.js --name ltm-workshop
               fi
               pm2 save --force >/dev/null
+              # Register pm2 as systemd service — persists across run-command process group exit
+              PM2_BIN=\$(command -v pm2 2>/dev/null || echo /usr/lib/node_modules/pm2/bin/pm2)
+              env PATH=\$PATH:/usr/bin \$PM2_BIN startup systemd -u root --hp /root >/dev/null 2>&1 || true
+              systemctl daemon-reload >/dev/null 2>&1 || true
+              systemctl enable pm2-root >/dev/null 2>&1 || true
+              systemctl restart pm2-root >/dev/null 2>&1 || true
               for i in \$(seq 1 6); do
                 sleep 5
                 if curl -sf http://localhost:${APP_PORT}/health >/dev/null; then
