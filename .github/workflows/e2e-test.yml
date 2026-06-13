@@ -278,16 +278,24 @@ jobs:
             --query "networkProfile.networkInterfaces[0].id" \
             --output tsv | xargs basename)
 
+          # Azure-created VMs use dynamic ip-config names (e.g. "ipconfigltmsa-demo-vm"), not "ipconfig1"
+          IP_CONFIG=$(az network nic show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name "$NIC_NAME" \
+            --query "ipConfigurations[0].name" \
+            --output tsv)
+
           BACKEND_POOL_ID=$(az network lb show \
             --resource-group ${{ env.AZURE_RG }} \
             --name ${{ env.AZURE_LB }} \
             --query "backendAddressPools[0].id" \
             --output tsv)
 
+          echo "Adding VM-1: NIC=$NIC_NAME, IPConfig=$IP_CONFIG"
           az network nic ip-config address-pool add \
             --resource-group ${{ env.AZURE_RG }} \
             --nic-name "$NIC_NAME" \
-            --ip-config-name ipconfig1 \
+            --ip-config-name "$IP_CONFIG" \
             --address-pool "$BACKEND_POOL_ID"
           echo "VM-1 added to LB backend pool"
 
@@ -375,7 +383,7 @@ jobs:
   verify:
     name: "Step 6 — Verify via Load Balancer"
     runs-on: ubuntu-latest
-    needs: [setup-lb, deploy-app]
+    needs: [setup-vm1, setup-lb, deploy-app]
 
     steps:
       - name: Azure login

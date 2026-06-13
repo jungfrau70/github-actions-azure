@@ -136,6 +136,13 @@ jobs:
             --query "networkProfile.networkInterfaces[0].id" \
             --output tsv | xargs basename)
 
+          # Azure-created VMs use dynamic ip-config names (e.g. "ipconfigltmsa-demo-vm"), not "ipconfig1"
+          IP_CONFIG=$(az network nic show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name "$NIC_NAME" \
+            --query "ipConfigurations[0].name" \
+            --output tsv)
+
           BACKEND_POOL_ID=$(az network lb show \
             --resource-group ${{ env.AZURE_RG }} \
             --name ${{ env.AZURE_LB }} \
@@ -146,16 +153,16 @@ jobs:
           CURRENT=$(az network nic ip-config show \
             --resource-group ${{ env.AZURE_RG }} \
             --nic-name "$NIC_NAME" \
-            --name ipconfig1 \
+            --name "$IP_CONFIG" \
             --query "loadBalancerBackendAddressPools[0].id" \
             --output tsv 2>/dev/null || echo "")
 
           if [ -z "$CURRENT" ]; then
-            echo "Adding ${{ env.AZURE_VM1 }} NIC to LB backend pool..."
+            echo "Adding ${{ env.AZURE_VM1 }} NIC ($NIC_NAME / $IP_CONFIG) to LB backend pool..."
             az network nic ip-config address-pool add \
               --resource-group ${{ env.AZURE_RG }} \
               --nic-name "$NIC_NAME" \
-              --ip-config-name ipconfig1 \
+              --ip-config-name "$IP_CONFIG" \
               --address-pool "$BACKEND_POOL_ID"
           else
             echo "${{ env.AZURE_VM1 }} already in backend pool — skip"
