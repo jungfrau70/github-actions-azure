@@ -60,7 +60,7 @@ env:
   MGMT_PREFIX:    10.0.2.0/24
   MGMT_NSG:       ltmsa-mgmt-nsg
   JUMPBOX_VM:     ltmsa-jumpbox
-  JUMPBOX_SIZE:   Standard_B2s
+  JUMPBOX_SIZE:   Standard_DS2_v2  # B2s unavailable in KoreaCentral (SkuNotAvailable)
   # web-snet: App VMs (SSH from Bastion/Jumpbox only — no internet SSH)
   WEB_SUBNET:     web-snet
   WEB_PREFIX:     10.0.1.0/24
