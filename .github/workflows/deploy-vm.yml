@@ -56,7 +56,7 @@ jobs:
         run: npm run test:unit
 
       - name: 앱 구문 확인
-        run: node -e "require('./src/app.js'); console.log('syntax OK')"
+        run: node --check src/app.js && echo "syntax OK"
 
   # ── 2. CD ──────────────────────────────────────────────────────────
   deploy:
