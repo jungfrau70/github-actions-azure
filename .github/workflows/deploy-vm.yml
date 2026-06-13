@@ -50,7 +50,7 @@ jobs:
           node-version: ${{ env.NODE_VER }}
 
       - name: 의존성 설치
-        run: npm ci
+        run: npm install
 
       - name: 단위 테스트
         run: npm run test:unit
