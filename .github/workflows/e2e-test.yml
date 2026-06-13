@@ -76,25 +76,37 @@ jobs:
       - name: Delete resource group
         run: |
           EXISTS=$(az group exists --name ${{ env.AZURE_RG }})
-          if [ "$EXISTS" == "true" ]; then
-            echo "Deleting ${{ env.AZURE_RG }} ..."
-            az group delete \
-              --name ${{ env.AZURE_RG }} \
-              --yes \
-              --no-wait
-            echo "Delete initiated (async). Waiting up to 10 min..."
-            for i in $(seq 1 30); do
-              sleep 20
-              STILL=$(az group exists --name ${{ env.AZURE_RG }})
-              echo "[$i/30] Exists: $STILL"
-              if [ "$STILL" == "false" ]; then
-                echo "Resource group deleted."
-                break
-              fi
-            done
-          else
+          if [ "$EXISTS" != "true" ]; then
             echo "${{ env.AZURE_RG }} does not exist — skip"
+            exit 0
           fi
+
+          # Remove all Resource Locks first — az group delete fails silently with --no-wait if locked
+          LOCKS=$(az lock list --resource-group ${{ env.AZURE_RG }} --query "[].name" -o tsv 2>/dev/null || true)
+          if [ -n "$LOCKS" ]; then
+            echo "Found locks — removing before deletion:"
+            while IFS= read -r lock; do
+              echo "  Removing lock: $lock"
+              az lock delete --name "$lock" --resource-group ${{ env.AZURE_RG }}
+            done <<< "$LOCKS"
+          fi
+
+          echo "Deleting ${{ env.AZURE_RG }} ..."
+          az group delete --name ${{ env.AZURE_RG }} --yes --no-wait
+
+          echo "Waiting for deletion (up to 10 min)..."
+          for i in $(seq 1 30); do
+            sleep 20
+            STILL=$(az group exists --name ${{ env.AZURE_RG }})
+            echo "[$i/30] Exists: $STILL"
+            if [ "$STILL" == "false" ]; then
+              echo "Resource group deleted."
+              exit 0
+            fi
+          done
+
+          echo "ERROR: ${{ env.AZURE_RG }} still exists after 10 min — check for remaining locks or dependencies"
+          exit 1
 
       - name: Azure logout
         if: always()
