@@ -19,7 +19,7 @@ param adminUsername string = 'azureuser'
 @secure()
 param adminPassword string
 
-@description('Existing web subnet ID to attach VM-2 NIC')
+@description('Existing web subnet ID to attach VM-2 NIC. NSG (ltmsa-web-nsg) is applied at subnet level — no NIC-level NSG needed.')
 param subnetId string
 
 @description('VM size — Standard_D2s_v3 available in Korea Central')

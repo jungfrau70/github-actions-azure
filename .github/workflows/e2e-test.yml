@@ -194,10 +194,12 @@ jobs:
             --source-address-prefixes ${{ env.BASTION_PREFIX }} \
             --destination-port-ranges 22 --access Allow
 
-          # Jumpbox: SSH outbound to web-snet (for internal VM access)
+          # Jumpbox: SSH outbound to web-snet (explicit — Azure default AllowVnetOutBound covers this,
+          #   but specifying direction=Outbound makes the intent auditable and policy-reviewable)
           az network nsg rule create \
             --resource-group ${{ env.AZURE_RG }} --nsg-name ${{ env.MGMT_NSG }} \
             --name allow-jumpbox-to-web --priority 200 --protocol Tcp \
+            --direction Outbound \
             --source-address-prefixes ${{ env.MGMT_PREFIX }} \
             --destination-address-prefixes ${{ env.WEB_PREFIX }} \
             --destination-port-ranges 22 --access Allow
@@ -527,13 +529,14 @@ jobs:
 
       - name: Scenario 2 — Verify Bastion provisioning
         run: |
-          echo "Checking Azure Bastion state..."
-          for i in $(seq 1 24); do
+          echo "Checking Azure Bastion state (max 15 min)..."
+          BASTION_READY=false
+          for i in $(seq 1 30); do
             STATE=$(az network bastion show \
               --resource-group ${{ env.AZURE_RG }} \
               --name ${{ env.BASTION_NAME }} \
               --query "provisioningState" --output tsv 2>/dev/null || echo "Pending")
-            echo "[${i}/24] Bastion state: $STATE"
+            echo "[${i}/30] Bastion state: $STATE"
             if [ "$STATE" = "Succeeded" ]; then
               BASTION_IP=$(az network public-ip show \
                 --resource-group ${{ env.AZURE_RG }} \
@@ -541,14 +544,19 @@ jobs:
                 --query ipAddress --output tsv)
               echo "Bastion ready — Public IP: $BASTION_IP"
               echo "Admin access path: Portal → Bastion → ${{ env.JUMPBOX_VM }}(mgmt-snet) → SSH → App VMs"
+              BASTION_READY=true
               break
             fi
             if [ "$STATE" = "Failed" ]; then
               echo "ERROR: Bastion provisioning failed"
               exit 1
             fi
-            sleep 20
+            sleep 30
           done
+          if [ "$BASTION_READY" = "false" ]; then
+            echo "ERROR: Bastion did not reach Succeeded within 15 min"
+            exit 1
+          fi
 
       - name: Scenario 2 — Verify Jumpbox (no public IP)
         run: |
