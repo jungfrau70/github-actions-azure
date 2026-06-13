@@ -1,0 +1,435 @@
+# LTM Korea Azure SA Workshop — End-to-End Automation Test
+#
+# Scope: Delete existing infrastructure → Rebuild from scratch → Verify app serving via LB
+#
+# What this workflow proves:
+#   1. Full infrastructure-as-code (Bicep) deployment is reproducible
+#   2. GitHub Actions can orchestrate end-to-end Azure provisioning
+#   3. The workshop Landing Zone pattern works reliably
+#
+# Required GitHub Secrets:
+#   AZURE_CREDENTIALS  — az ad sp create-for-rbac --sdk-auth JSON
+#   ADMIN_PASSWORD     — VM admin password
+#
+# Trigger: manual only (workflow_dispatch) for safety
+
+name: E2E Test — Full Fresh Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_destroy:
+        description: 'Type "DESTROY" to confirm deletion of ltmsa-security-rg'
+        required: true
+        default: ''
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, production]
+
+env:
+  AZURE_RG:       ltmsa-security-rg
+  AZURE_LOCATION: koreacentral
+  VNET_NAME:      ltmsa-vnet
+  VNET_PREFIX:    10.0.0.0/16
+  WEB_SUBNET:     web-snet
+  WEB_PREFIX:     10.0.1.0/24
+  NSG_NAME:       ltmsa-web-nsg
+  AZURE_VM1:      ltmsa-demo-vm
+  AZURE_VM2:      ltmsa-demo-vm-2
+  AZURE_LB:       ltmsa-lb
+  VM_SIZE:        Standard_D2s_v3
+  VM_IMAGE_URN:   Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest
+  APP_DIR:        /opt/ltm-workshop
+  APP_PORT:       3000
+  NODE_VER:       "18"
+
+jobs:
+  # ── Gate: safety check ─────────────────────────────────────────────
+  preflight:
+    name: "Preflight — Safety Gate"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate destroy confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+            echo "ERROR: confirm_destroy must be 'DESTROY' to proceed."
+            echo "Input was: '${{ github.event.inputs.confirm_destroy }}'"
+            exit 1
+          fi
+          echo "Destroy confirmed. Proceeding with full E2E test."
+
+  # ── 1. Cleanup: delete resource group ──────────────────────────────
+  cleanup:
+    name: "Step 1 — Delete ltmsa-security-rg"
+    runs-on: ubuntu-latest
+    needs: preflight
+
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Delete resource group
+        run: |
+          EXISTS=$(az group exists --name ${{ env.AZURE_RG }})
+          if [ "$EXISTS" == "true" ]; then
+            echo "Deleting ${{ env.AZURE_RG }} ..."
+            az group delete \
+              --name ${{ env.AZURE_RG }} \
+              --yes \
+              --no-wait
+            echo "Delete initiated (async). Waiting up to 10 min..."
+            for i in $(seq 1 30); do
+              sleep 20
+              STILL=$(az group exists --name ${{ env.AZURE_RG }})
+              echo "[$i/30] Exists: $STILL"
+              if [ "$STILL" == "false" ]; then
+                echo "Resource group deleted."
+                break
+              fi
+            done
+          else
+            echo "${{ env.AZURE_RG }} does not exist — skip"
+          fi
+
+      - name: Azure logout
+        if: always()
+        run: az logout
+
+  # ── 2. Network: VNet + NSG ─────────────────────────────────────────
+  setup-network:
+    name: "Step 2 — VNet + NSG"
+    runs-on: ubuntu-latest
+    needs: cleanup
+    outputs:
+      subnet_id: ${{ steps.vnet.outputs.subnet_id }}
+
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create resource group
+        run: |
+          az group create \
+            --name ${{ env.AZURE_RG }} \
+            --location ${{ env.AZURE_LOCATION }} \
+            --tags Environment=${{ github.event.inputs.environment }} \
+                   Project=LTM-SA-Workshop \
+                   ManagedBy=GitHubActions
+
+      - name: Create NSG
+        run: |
+          az network nsg create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.NSG_NAME }}
+
+          # Allow SSH (management)
+          az network nsg rule create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --nsg-name ${{ env.NSG_NAME }} \
+            --name allow-ssh \
+            --priority 100 \
+            --protocol Tcp \
+            --destination-port-ranges 22 \
+            --access Allow
+
+          # Allow app port 3000 (from LB + direct)
+          az network nsg rule create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --nsg-name ${{ env.NSG_NAME }} \
+            --name allow-app-3000 \
+            --priority 200 \
+            --protocol Tcp \
+            --destination-port-ranges ${{ env.APP_PORT }} \
+            --access Allow
+
+          # Allow HTTP 80 (Load Balancer frontend)
+          az network nsg rule create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --nsg-name ${{ env.NSG_NAME }} \
+            --name allow-http \
+            --priority 210 \
+            --protocol Tcp \
+            --destination-port-ranges 80 \
+            --access Allow
+
+          # Allow AzureLoadBalancer health probes
+          az network nsg rule create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --nsg-name ${{ env.NSG_NAME }} \
+            --name allow-lb-probe \
+            --priority 300 \
+            --protocol Tcp \
+            --source-address-prefixes AzureLoadBalancer \
+            --destination-port-ranges "*" \
+            --access Allow
+
+      - name: Create VNet + subnet
+        id: vnet
+        run: |
+          az network vnet create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.VNET_NAME }} \
+            --address-prefix ${{ env.VNET_PREFIX }} \
+            --subnet-name ${{ env.WEB_SUBNET }} \
+            --subnet-prefix ${{ env.WEB_PREFIX }} \
+            --network-security-group ${{ env.NSG_NAME }}
+
+          SUBNET_ID=$(az network vnet subnet show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --vnet-name ${{ env.VNET_NAME }} \
+            --name ${{ env.WEB_SUBNET }} \
+            --query id \
+            --output tsv)
+          echo "subnet_id=$SUBNET_ID" >> $GITHUB_OUTPUT
+          echo "Subnet: $SUBNET_ID"
+
+      - name: Azure logout
+        if: always()
+        run: az logout
+
+  # ── 3. Compute: VM-1 ───────────────────────────────────────────────
+  setup-vm1:
+    name: "Step 3 — Create VM-1"
+    runs-on: ubuntu-latest
+    needs: setup-network
+    outputs:
+      vm1_ip: ${{ steps.vm1.outputs.vm1_ip }}
+
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create VM-1
+        id: vm1
+        run: |
+          az vm create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_VM1 }} \
+            --location ${{ env.AZURE_LOCATION }} \
+            --image ${{ env.VM_IMAGE_URN }} \
+            --size ${{ env.VM_SIZE }} \
+            --admin-username azureuser \
+            --admin-password "${{ secrets.ADMIN_PASSWORD }}" \
+            --authentication-type password \
+            --vnet-name ${{ env.VNET_NAME }} \
+            --subnet ${{ env.WEB_SUBNET }} \
+            --nsg "" \
+            --public-ip-sku Standard \
+            --tags Project=LTM-SA-Workshop VM=primary
+
+          VM1_IP=$(az vm show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_VM1 }} \
+            --show-details \
+            --query publicIps \
+            --output tsv)
+          echo "vm1_ip=$VM1_IP" >> $GITHUB_OUTPUT
+          echo "VM-1 IP: $VM1_IP"
+
+      - name: Azure logout
+        if: always()
+        run: az logout
+
+  # ── 4. IaC: lb.bicep (LB + VM-2) ──────────────────────────────────
+  setup-lb:
+    name: "Step 4 — Bicep: LB + VM-2"
+    runs-on: ubuntu-latest
+    needs: [setup-network, setup-vm1]
+    outputs:
+      lb_ip: ${{ steps.bicep.outputs.lb_ip }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy lb.bicep
+        id: bicep
+        run: |
+          RESULT=$(az deployment group create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --template-file bicep/lb.bicep \
+            --parameters adminPassword="${{ secrets.ADMIN_PASSWORD }}" \
+                         subnetId="${{ needs.setup-network.outputs.subnet_id }}" \
+            --query properties.outputs \
+            --output json)
+
+          LB_IP=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['lbPublicIp']['value'])")
+          echo "lb_ip=$LB_IP" >> $GITHUB_OUTPUT
+          echo "LB IP: $LB_IP"
+
+      - name: Add VM-1 NIC to LB backend pool
+        run: |
+          NIC_NAME=$(az vm show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_VM1 }} \
+            --query "networkProfile.networkInterfaces[0].id" \
+            --output tsv | xargs basename)
+
+          BACKEND_POOL_ID=$(az network lb show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_LB }} \
+            --query "backendAddressPools[0].id" \
+            --output tsv)
+
+          az network nic ip-config address-pool add \
+            --resource-group ${{ env.AZURE_RG }} \
+            --nic-name "$NIC_NAME" \
+            --ip-config-name ipconfig1 \
+            --address-pool "$BACKEND_POOL_ID"
+          echo "VM-1 added to LB backend pool"
+
+      - name: Azure logout
+        if: always()
+        run: az logout
+
+  # ── 5. App: deploy to both VMs ────────────────────────────────────
+  deploy-app:
+    name: "Step 5 — App: ${{ matrix.vm }}"
+    runs-on: ubuntu-latest
+    needs: [setup-lb]
+    strategy:
+      fail-fast: false
+      matrix:
+        vm: [ltmsa-demo-vm, ltmsa-demo-vm-2]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Prepare deployment package
+        id: pkg
+        run: |
+          echo "app_b64=$(base64 -w0 src/app.js)" >> $GITHUB_OUTPUT
+          echo "pkg_b64=$(base64 -w0 package.json)" >> $GITHUB_OUTPUT
+          echo "app_version=$(node -p "require('./package.json').version")-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Deploy app to ${{ matrix.vm }}
+        run: |
+          APP_B64="${{ steps.pkg.outputs.app_b64 }}"
+          PKG_B64="${{ steps.pkg.outputs.pkg_b64 }}"
+          APP_VERSION="${{ steps.pkg.outputs.app_version }}"
+          APP_DIR="${{ env.APP_DIR }}"
+          APP_PORT="${{ env.APP_PORT }}"
+
+          az vm run-command invoke \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ matrix.vm }} \
+            --command-id RunShellScript \
+            --scripts "
+              set -e
+              if ! command -v node &>/dev/null; then
+                curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - >/dev/null
+                sudo apt-get install -y nodejs >/dev/null
+              fi
+              if ! command -v pm2 &>/dev/null; then
+                sudo npm install -g pm2 >/dev/null 2>&1
+              fi
+              sudo mkdir -p ${APP_DIR}
+              sudo chown azureuser:azureuser ${APP_DIR}
+              cd ${APP_DIR}
+              echo '${APP_B64}' | base64 -d > app.js
+              echo '${PKG_B64}' | base64 -d > package.json
+              npm install --production --silent
+              if pm2 describe ltm-workshop &>/dev/null; then
+                pm2 restart ltm-workshop --update-env
+              else
+                PORT=${APP_PORT} APP_VERSION=${APP_VERSION} \
+                  pm2 start app.js --name ltm-workshop
+              fi
+              pm2 save --force >/dev/null
+              for i in \$(seq 1 6); do
+                sleep 5
+                if curl -sf http://localhost:${APP_PORT}/health >/dev/null; then
+                  echo \"[OK] ${{ matrix.vm }} healthy (attempt \${i}/6)\"
+                  exit 0
+                fi
+              done
+              echo 'Health check failed'
+              exit 1
+            " \
+            --query "value[0].message" \
+            --output tsv
+
+      - name: Azure logout
+        if: always()
+        run: az logout
+
+  # ── 6. Final: verify via LB ───────────────────────────────────────
+  verify:
+    name: "Step 6 — Verify via Load Balancer"
+    runs-on: ubuntu-latest
+    needs: [setup-lb, deploy-app]
+
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Wait for LB health probe
+        run: |
+          LB_IP="${{ needs.setup-lb.outputs.lb_ip }}"
+          echo "Waiting for LB at http://${LB_IP}/health ..."
+          for i in $(seq 1 18); do
+            sleep 10
+            if curl -sf "http://${LB_IP}/health" >/dev/null 2>&1; then
+              echo "LB is healthy (attempt ${i}/18)"
+              break
+            fi
+            echo "Waiting... (${i}/18)"
+          done
+
+      - name: Final health check
+        run: |
+          LB_IP="${{ needs.setup-lb.outputs.lb_ip }}"
+          echo "=== LB Health ==="
+          curl -sf "http://${LB_IP}/health" | python3 -m json.tool
+          echo ""
+          echo "=== API Modules ==="
+          curl -sf "http://${LB_IP}/api/modules" | python3 -m json.tool
+          echo ""
+          echo "=== API Status ==="
+          curl -sf "http://${LB_IP}/api/status" | python3 -m json.tool
+
+      - name: E2E result summary
+        run: |
+          LB_IP="${{ needs.setup-lb.outputs.lb_ip }}"
+          VM1_IP="${{ needs.setup-vm1.outputs.vm1_ip }}"
+          echo ""
+          echo "=================================================="
+          echo "  E2E TEST PASSED"
+          echo "=================================================="
+          echo "  LB URL  : http://${LB_IP}          (primary)"
+          echo "  VM-1    : http://${VM1_IP}:${{ env.APP_PORT }} (direct)"
+          echo "  VM-2    : (private, via LB only)"
+          echo "  Commit  : ${{ github.sha }}"
+          echo "  Env     : ${{ github.event.inputs.environment }}"
+          echo "=================================================="
+
+          echo "### E2E Test Passed" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| LB URL | http://${LB_IP} |" >> $GITHUB_STEP_SUMMARY
+          echo "| VM-1 (direct) | http://${VM1_IP}:${{ env.APP_PORT }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Azure logout
+        if: always()
+        run: az logout

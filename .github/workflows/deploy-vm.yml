@@ -1,21 +1,25 @@
-# 🚀 LTM Korea Azure SA Workshop — VM 배포 워크플로우 (실습 7.4)
+# LTM Korea Azure SA Workshop — Deploy Workflow (Lab 7.4 + 7.5)
 #
-# 흐름: CI(테스트) → CD(Azure VM 배포)
-#   - Azure 로그인: AZURE_CREDENTIALS secret (Service Principal)
-#   - VM 배포: az vm run-command invoke (SSH 포트 불필요 — Zero Trust)
-#   - 프로세스 관리: pm2 (재시작 후에도 자동 복구)
-#   - 헬스 체크: /health 엔드포인트 확인
+# Flow: CI (test) → CD (Bicep: LB + VM-2) → App deploy (VM-1 + VM-2) → LB verify
+#   - Azure login: AZURE_CREDENTIALS secret (Service Principal)
+#   - IaC: lb.bicep deploys Standard LB + VM-2
+#   - App deploy: az vm run-command invoke (no SSH — Zero Trust)
+#   - Process manager: pm2
+#   - Health check: /health endpoint via LB
 #
-# 필요한 GitHub Secrets:
-#   AZURE_CREDENTIALS  — az ad sp create-for-rbac --sdk-auth 출력 JSON 전체
+# Required GitHub Secrets:
+#   AZURE_CREDENTIALS  — az ad sp create-for-rbac --sdk-auth JSON
+#   ADMIN_PASSWORD     — VM admin password for VM-2 Bicep deployment
 #
-# 배포 대상:
-#   리소스 그룹: ltmsa-security-rg
-#   VM:          ltmsa-demo-vm  (Korea Central, Ubuntu 22.04)
-#   앱 경로:     /opt/ltm-workshop
-#   포트:        3000 (NSG allow-app-3000 규칙으로 허용)
+# Deploy targets:
+#   Resource Group: ltmsa-security-rg
+#   VM-1:           ltmsa-demo-vm   (existing)
+#   VM-2:           ltmsa-demo-vm-2 (created by lb.bicep)
+#   Load Balancer:  ltmsa-lb        (port 80 → 3000)
+#   App path:       /opt/ltm-workshop
+#   App port:       3000
 
-name: Deploy to Azure VM
+name: Deploy to Azure VM (LB HA)
 
 on:
   push:
@@ -23,18 +27,26 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: '배포 환경'
+        description: 'Deploy environment'
         required: true
         default: 'dev'
         type: choice
         options: [ dev, staging, production ]
+      skip_infra:
+        description: 'Skip Bicep infra deploy (LB already exists)'
+        required: false
+        default: 'false'
+        type: choice
+        options: [ 'false', 'true' ]
 
 env:
-  AZURE_RG:   ltmsa-security-rg
-  AZURE_VM:   ltmsa-demo-vm
-  APP_DIR:    /opt/ltm-workshop
-  APP_PORT:   3000
-  NODE_VER:   "18"
+  AZURE_RG:    ltmsa-security-rg
+  AZURE_VM1:   ltmsa-demo-vm
+  AZURE_VM2:   ltmsa-demo-vm-2
+  AZURE_LB:    ltmsa-lb
+  APP_DIR:     /opt/ltm-workshop
+  APP_PORT:    3000
+  NODE_VER:    "18"
 
 jobs:
   # ── 1. CI ──────────────────────────────────────────────────────────
@@ -44,52 +56,152 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Node.js 설정
+      - name: Node.js setup
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VER }}
 
-      - name: 의존성 설치
+      - name: Install dependencies
         run: npm install
 
-      - name: 단위 테스트
+      - name: Unit tests
         run: npm run test:unit
 
-      - name: 앱 구문 확인
+      - name: Syntax check
         run: node --check src/app.js && echo "syntax OK"
 
-  # ── 2. CD ──────────────────────────────────────────────────────────
-  deploy:
-    name: "CD — Azure VM 배포"
+  # ── 2. CD: Bicep infra (LB + VM-2) ────────────────────────────────
+  deploy-infra:
+    name: "CD — Bicep: LB + VM-2"
     runs-on: ubuntu-latest
     needs: ci
-    environment: ${{ github.event.inputs.environment || 'dev' }}
+    if: ${{ github.event.inputs.skip_infra != 'true' }}
+    outputs:
+      lb_ip: ${{ steps.bicep.outputs.lb_ip }}
+      lb_fqdn: ${{ steps.bicep.outputs.lb_fqdn }}
 
     steps:
       - uses: actions/checkout@v4
 
-      # Azure 로그인 (Service Principal)
-      - name: Azure 로그인
+      - name: Azure login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # VM 실행 상태 확인 — 중지 시 자동 시작
-      - name: VM 상태 확인
+      - name: Get web subnet ID from VM-1 NIC
+        id: subnet
+        run: |
+          NIC_ID=$(az vm show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_VM1 }} \
+            --query "networkProfile.networkInterfaces[0].id" \
+            --output tsv)
+          SUBNET_ID=$(az network nic show --ids "$NIC_ID" \
+            --query "ipConfigurations[0].subnet.id" \
+            --output tsv)
+          echo "subnet_id=$SUBNET_ID" >> $GITHUB_OUTPUT
+          echo "Subnet: $SUBNET_ID"
+
+      - name: Bicep what-if (LB + VM-2)
+        run: |
+          az deployment group what-if \
+            --resource-group ${{ env.AZURE_RG }} \
+            --template-file bicep/lb.bicep \
+            --parameters adminPassword="${{ secrets.ADMIN_PASSWORD }}" \
+                         subnetId="${{ steps.subnet.outputs.subnet_id }}"
+
+      - name: Deploy lb.bicep
+        id: bicep
+        run: |
+          RESULT=$(az deployment group create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --template-file bicep/lb.bicep \
+            --parameters adminPassword="${{ secrets.ADMIN_PASSWORD }}" \
+                         subnetId="${{ steps.subnet.outputs.subnet_id }}" \
+            --query properties.outputs \
+            --output json)
+
+          LB_IP=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['lbPublicIp']['value'])")
+          LB_FQDN=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['lbFqdn']['value'])")
+          echo "lb_ip=$LB_IP"   >> $GITHUB_OUTPUT
+          echo "lb_fqdn=$LB_FQDN" >> $GITHUB_OUTPUT
+          echo "LB IP:   $LB_IP"
+          echo "LB FQDN: $LB_FQDN"
+
+      - name: Add VM-1 NIC to LB backend pool
+        run: |
+          NIC_NAME=$(az vm show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_VM1 }} \
+            --query "networkProfile.networkInterfaces[0].id" \
+            --output tsv | xargs basename)
+
+          BACKEND_POOL_ID=$(az network lb show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_LB }} \
+            --query "backendAddressPools[0].id" \
+            --output tsv)
+
+          # Check if already in pool to avoid duplicate error
+          CURRENT=$(az network nic ip-config show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --nic-name "$NIC_NAME" \
+            --name ipconfig1 \
+            --query "loadBalancerBackendAddressPools[0].id" \
+            --output tsv 2>/dev/null || echo "")
+
+          if [ -z "$CURRENT" ]; then
+            echo "Adding ${{ env.AZURE_VM1 }} NIC to LB backend pool..."
+            az network nic ip-config address-pool add \
+              --resource-group ${{ env.AZURE_RG }} \
+              --nic-name "$NIC_NAME" \
+              --ip-config-name ipconfig1 \
+              --address-pool "$BACKEND_POOL_ID"
+          else
+            echo "${{ env.AZURE_VM1 }} already in backend pool — skip"
+          fi
+
+      - name: Azure logout
+        if: always()
+        run: az logout
+
+  # ── 3. CD: App deploy to VM-1 and VM-2 ────────────────────────────
+  deploy-app:
+    name: "CD — App: ${{ matrix.vm }}"
+    runs-on: ubuntu-latest
+    needs: [ci, deploy-infra]
+    if: always() && needs.ci.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        vm: [ltmsa-demo-vm, ltmsa-demo-vm-2]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Check VM state
         run: |
           STATE=$(az vm get-instance-view \
             --resource-group ${{ env.AZURE_RG }} \
-            --name ${{ env.AZURE_VM }} \
+            --name ${{ matrix.vm }} \
             --query "instanceView.statuses[?starts_with(code,'PowerState')].displayStatus" \
-            --output tsv)
-          echo "VM 상태: $STATE"
+            --output tsv 2>/dev/null || echo "")
+          echo "VM ${{ matrix.vm }} state: $STATE"
+          if [ -z "$STATE" ]; then
+            echo "VM ${{ matrix.vm }} not found — skip"
+            exit 0
+          fi
           if [[ "$STATE" != "VM running" ]]; then
-            echo "VM 시작 중..."
-            az vm start --resource-group ${{ env.AZURE_RG }} --name ${{ env.AZURE_VM }}
+            echo "Starting VM..."
+            az vm start --resource-group ${{ env.AZURE_RG }} --name ${{ matrix.vm }}
           fi
 
-      # 앱 파일을 base64로 인코딩하여 VM에 전달
-      - name: 배포 패키지 준비
+      - name: Prepare deployment package
         id: pkg
         run: |
           APP_B64=$(base64 -w0 src/app.js)
@@ -98,123 +210,139 @@ jobs:
           echo "pkg_b64=$PKG_B64" >> $GITHUB_OUTPUT
           echo "app_version=$(node -p "require('./package.json').version")-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-      # VM에 배포 (az vm run-command — SSH 불필요)
-      - name: VM 배포 실행
+      - name: Deploy app to ${{ matrix.vm }}
         run: |
-          APP_VERSION="${{ steps.pkg.outputs.app_version }}"
           APP_B64="${{ steps.pkg.outputs.app_b64 }}"
           PKG_B64="${{ steps.pkg.outputs.pkg_b64 }}"
+          APP_VERSION="${{ steps.pkg.outputs.app_version }}"
           APP_DIR="${{ env.APP_DIR }}"
           APP_PORT="${{ env.APP_PORT }}"
           NODE_ENV="${{ github.event.inputs.environment || 'dev' }}"
 
           az vm run-command invoke \
             --resource-group ${{ env.AZURE_RG }} \
-            --name ${{ env.AZURE_VM }} \
+            --name ${{ matrix.vm }} \
             --command-id RunShellScript \
             --scripts "
               set -e
-              echo '=== LTM Azure SA Workshop 배포 시작 ==='
+              echo '=== LTM Azure SA Workshop deploy: ${{ matrix.vm }} ==='
 
-              # Node.js 설치 확인
               if ! command -v node &>/dev/null; then
-                echo 'Node.js 설치 중...'
-                curl -fsSL https://deb.nodesource.com/setup_${NODE_VER}.x | sudo -E bash - >/dev/null
+                curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - >/dev/null
                 sudo apt-get install -y nodejs >/dev/null
               fi
-              echo \"Node.js: \$(node --version)  npm: \$(npm --version)\"
+              echo \"Node.js: \$(node --version)\"
 
-              # pm2 설치 확인
               if ! command -v pm2 &>/dev/null; then
-                echo 'pm2 설치 중...'
                 sudo npm install -g pm2 >/dev/null 2>&1
               fi
-              echo \"pm2: \$(pm2 --version)\"
 
-              # 앱 디렉토리 준비
               sudo mkdir -p ${APP_DIR}
               sudo chown azureuser:azureuser ${APP_DIR}
               cd ${APP_DIR}
 
-              # 앱 파일 배포
               echo '${APP_B64}' | base64 -d > app.js
               echo '${PKG_B64}' | base64 -d > package.json
-
-              # 의존성 설치 (프로덕션만)
               npm install --production --silent
-              echo '의존성 설치 완료'
+              echo 'Dependencies installed'
 
-              # pm2로 앱 시작/재시작
               if pm2 describe ltm-workshop &>/dev/null; then
                 pm2 restart ltm-workshop --update-env
               else
                 PORT=${APP_PORT} NODE_ENV=${NODE_ENV} APP_VERSION=${APP_VERSION} \
                   pm2 start app.js --name ltm-workshop
               fi
-
-              # pm2 부팅 자동 시작 등록
               pm2 save --force >/dev/null
 
-              # 헬스 체크 (최대 30초 대기)
-              echo '헬스 체크 중...'
+              echo 'Health check...'
               for i in \$(seq 1 6); do
                 sleep 5
                 if curl -sf http://localhost:${APP_PORT}/health >/dev/null; then
-                  echo \"=== 배포 성공! (시도 \${i}/6) ===\"
+                  echo \"Deploy success (attempt \${i}/6)\"
                   curl -s http://localhost:${APP_PORT}/health
-                  pm2 status ltm-workshop
                   exit 0
                 fi
-                echo \"대기 중... (\${i}/6)\"
+                echo \"Waiting... (\${i}/6)\"
               done
-              echo '헬스 체크 실패'
+              echo 'Health check failed'
               pm2 logs ltm-workshop --lines 20 --nostream || true
               exit 1
             " \
             --query "value[0].message" \
             --output tsv
 
-      # 배포 결과 요약
-      - name: 배포 결과
-        if: success()
-        run: |
-          VM_IP=$(az vm show \
-            --resource-group ${{ env.AZURE_RG }} \
-            --name ${{ env.AZURE_VM }} \
-            --show-details \
-            --query publicIps \
-            --output tsv)
+      - name: Azure logout
+        if: always()
+        run: az logout
 
+  # ── 4. Verify via Load Balancer ────────────────────────────────────
+  verify-lb:
+    name: "Verify — Load Balancer Health"
+    runs-on: ubuntu-latest
+    needs: [deploy-infra, deploy-app]
+    if: always() && needs.deploy-app.result == 'success'
+
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get LB public IP
+        id: lb
+        run: |
+          LB_IP=$(az network public-ip show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_LB }}-pip \
+            --query ipAddress \
+            --output tsv 2>/dev/null || echo "${{ needs.deploy-infra.outputs.lb_ip }}")
+          echo "lb_ip=$LB_IP" >> $GITHUB_OUTPUT
+          echo "LB IP: $LB_IP"
+
+      - name: Wait for LB health probe
+        run: |
+          LB_IP="${{ steps.lb.outputs.lb_ip }}"
+          echo "Waiting for LB to be healthy at http://${LB_IP}:80/health ..."
+          for i in $(seq 1 12); do
+            sleep 10
+            if curl -sf "http://${LB_IP}/health" >/dev/null 2>&1; then
+              echo "LB health check passed (attempt ${i}/12)"
+              break
+            fi
+            echo "Waiting... (${i}/12)"
+          done
+
+      - name: Verify LB response
+        run: |
+          LB_IP="${{ steps.lb.outputs.lb_ip }}"
+          echo "=== LB Health Check ==="
+          curl -sf "http://${LB_IP}/health" | python3 -m json.tool
+          echo ""
+          echo "=== LB Homepage Check ==="
+          curl -sf "http://${LB_IP}/" | grep -o 'LTM Korea.*Landing Zone' | head -1
+
+      - name: Summary
+        run: |
+          LB_IP="${{ steps.lb.outputs.lb_ip }}"
           echo ""
           echo "=================================================="
-          echo "  ✅  배포 완료"
+          echo "  DEPLOYMENT COMPLETE"
           echo "=================================================="
-          echo "  앱 URL  : http://${VM_IP}:${{ env.APP_PORT }}"
-          echo "  버전    : ${{ steps.pkg.outputs.app_version }}"
-          echo "  환경    : ${{ github.event.inputs.environment || 'dev' }}"
-          echo "  커밋    : ${{ github.sha }}"
+          echo "  LB URL  : http://${LB_IP}"
+          echo "  VM-1    : ${{ env.AZURE_VM1 }}"
+          echo "  VM-2    : ${{ env.AZURE_VM2 }}"
+          echo "  Version : ${{ needs.deploy-app.outputs.app_version || 'see above' }}"
+          echo "  Commit  : ${{ github.sha }}"
           echo "=================================================="
 
-          echo "### ✅ 배포 완료" >> $GITHUB_STEP_SUMMARY
-          echo "| 항목 | 값 |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
-          echo "| 앱 URL | http://${VM_IP}:${{ env.APP_PORT }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 버전 | ${{ steps.pkg.outputs.app_version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 커밋 | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| LB URL | http://${LB_IP} |" >> $GITHUB_STEP_SUMMARY
+          echo "| VM-1 | ${{ env.AZURE_VM1 }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| VM-2 | ${{ env.AZURE_VM2 }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
 
-      # 외부에서 앱 응답 확인
-      - name: 외부 접근 확인
-        if: success()
-        run: |
-          VM_IP=$(az vm show \
-            --resource-group ${{ env.AZURE_RG }} \
-            --name ${{ env.AZURE_VM }} \
-            --show-details \
-            --query publicIps \
-            --output tsv)
-          echo "외부 헬스 체크: http://${VM_IP}:${{ env.APP_PORT }}/health"
-          curl -sf "http://${VM_IP}:${{ env.APP_PORT }}/health" | python3 -m json.tool
-
-      - name: Azure 로그아웃
+      - name: Azure logout
         if: always()
         run: az logout
