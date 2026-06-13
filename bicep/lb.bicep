@@ -100,25 +100,7 @@ resource lb 'Microsoft.Network/loadBalancers@2023-04-01' = {
           backendPort: appPort
           idleTimeoutInMinutes: 4
           enableFloatingIP: false
-          disableOutboundSnat: true
-        }
-      }
-    ]
-    outboundRules: [
-      {
-        name: 'outbound-rule'
-        properties: {
-          frontendIPConfigurations: [
-            {
-              id: resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', '${prefix}-lb', 'lb-frontend')
-            }
-          ]
-          backendAddressPool: {
-            id: resourceId('Microsoft.Network/loadBalancers/backendAddressPools', '${prefix}-lb', 'lb-backend')
-          }
-          protocol: 'All'
-          allocatedOutboundPorts: 1024
-          idleTimeoutInMinutes: 4
+          // disableOutboundSnat defaults to false — do NOT use outboundRules when VMs have instance-level public IPs
         }
       }
     ]
