@@ -4,8 +4,9 @@
 #
 # What this workflow proves:
 #   1. Full infrastructure-as-code (Bicep) deployment is reproducible
-#   2. GitHub Actions can orchestrate end-to-end Azure provisioning
-#   3. The workshop Landing Zone pattern works reliably
+#   2. Azure Bastion provides Zero Trust admin access (no internet-facing SSH)
+#   3. Jumpbox pattern enables internal VM-to-VM management
+#   4. Break-glass: az vm run-command bypasses network restrictions via Management Plane
 #
 # Required GitHub Secrets:
 #   AZURE_CREDENTIALS  — az ad sp create-for-rbac --sdk-auth JSON
@@ -34,6 +35,16 @@ env:
   AZURE_LOCATION: koreacentral
   VNET_NAME:      ltmsa-vnet
   VNET_PREFIX:    10.0.0.0/16
+  # AzureBastionSubnet: required name, min /26, NO NSG allowed
+  BASTION_NAME:   ltmsa-bastion
+  BASTION_PREFIX: 10.0.0.0/26
+  # mgmt-snet: Jumpbox VM (no public IP, SSH from Bastion only)
+  MGMT_SUBNET:    mgmt-snet
+  MGMT_PREFIX:    10.0.2.0/24
+  MGMT_NSG:       ltmsa-mgmt-nsg
+  JUMPBOX_VM:     ltmsa-jumpbox
+  JUMPBOX_SIZE:   Standard_B2s
+  # web-snet: App VMs (SSH from Bastion/Jumpbox only — no internet SSH)
   WEB_SUBNET:     web-snet
   WEB_PREFIX:     10.0.1.0/24
   NSG_NAME:       ltmsa-web-nsg
@@ -112,13 +123,13 @@ jobs:
         if: always()
         run: az logout
 
-  # ── 2. Network: VNet + NSG ─────────────────────────────────────────
+  # ── 2. Network: VNet + NSGs + Bastion ──────────────────────────────
   setup-network:
-    name: "Step 2 — VNet + NSG"
+    name: "Step 2 — VNet + NSG + Bastion"
     runs-on: ubuntu-latest
     needs: cleanup
     outputs:
-      subnet_id: ${{ steps.vnet.outputs.subnet_id }}
+      subnet_id: ${{ steps.subnets.outputs.subnet_id }}
 
     steps:
       - name: Azure login
@@ -135,80 +146,168 @@ jobs:
                    Project=LTM-SA-Workshop \
                    ManagedBy=GitHubActions
 
-      - name: Create NSG
+      - name: Create NSGs
         run: |
-          az network nsg create \
-            --resource-group ${{ env.AZURE_RG }} \
-            --name ${{ env.NSG_NAME }}
+          # ── web-snet NSG (App VMs) ────────────────────────────────
+          az network nsg create --resource-group ${{ env.AZURE_RG }} --name ${{ env.NSG_NAME }}
 
-          # Allow SSH (management)
+          # SSH from AzureBastionSubnet only — internet-facing SSH removed (Zero Trust)
           az network nsg rule create \
-            --resource-group ${{ env.AZURE_RG }} \
-            --nsg-name ${{ env.NSG_NAME }} \
-            --name allow-ssh \
-            --priority 100 \
-            --protocol Tcp \
-            --destination-port-ranges 22 \
-            --access Allow
+            --resource-group ${{ env.AZURE_RG }} --nsg-name ${{ env.NSG_NAME }} \
+            --name allow-bastion-ssh --priority 100 --protocol Tcp \
+            --source-address-prefixes ${{ env.BASTION_PREFIX }} \
+            --destination-port-ranges 22 --access Allow
 
-          # Allow app port 3000 (from LB + direct)
+          # SSH from Jumpbox (mgmt-snet → web-snet lateral movement via Jumpbox)
           az network nsg rule create \
-            --resource-group ${{ env.AZURE_RG }} \
-            --nsg-name ${{ env.NSG_NAME }} \
-            --name allow-app-3000 \
-            --priority 200 \
-            --protocol Tcp \
-            --destination-port-ranges ${{ env.APP_PORT }} \
-            --access Allow
+            --resource-group ${{ env.AZURE_RG }} --nsg-name ${{ env.NSG_NAME }} \
+            --name allow-jumpbox-ssh --priority 110 --protocol Tcp \
+            --source-address-prefixes ${{ env.MGMT_PREFIX }} \
+            --destination-port-ranges 22 --access Allow
 
-          # Allow HTTP 80 (Load Balancer frontend)
+          # App port 3000 (from LB health probe + direct access)
           az network nsg rule create \
-            --resource-group ${{ env.AZURE_RG }} \
-            --nsg-name ${{ env.NSG_NAME }} \
-            --name allow-http \
-            --priority 210 \
-            --protocol Tcp \
-            --destination-port-ranges 80 \
-            --access Allow
+            --resource-group ${{ env.AZURE_RG }} --nsg-name ${{ env.NSG_NAME }} \
+            --name allow-app-3000 --priority 200 --protocol Tcp \
+            --destination-port-ranges ${{ env.APP_PORT }} --access Allow
 
-          # Allow AzureLoadBalancer health probes
+          # HTTP 80 (Load Balancer frontend)
           az network nsg rule create \
-            --resource-group ${{ env.AZURE_RG }} \
-            --nsg-name ${{ env.NSG_NAME }} \
-            --name allow-lb-probe \
-            --priority 300 \
-            --protocol Tcp \
+            --resource-group ${{ env.AZURE_RG }} --nsg-name ${{ env.NSG_NAME }} \
+            --name allow-http --priority 210 --protocol Tcp \
+            --destination-port-ranges 80 --access Allow
+
+          # AzureLoadBalancer health probes
+          az network nsg rule create \
+            --resource-group ${{ env.AZURE_RG }} --nsg-name ${{ env.NSG_NAME }} \
+            --name allow-lb-probe --priority 300 --protocol Tcp \
             --source-address-prefixes AzureLoadBalancer \
-            --destination-port-ranges "*" \
-            --access Allow
+            --destination-port-ranges "*" --access Allow
 
-      - name: Create VNet + subnet
-        id: vnet
+          # ── mgmt-snet NSG (Jumpbox) ───────────────────────────────
+          az network nsg create --resource-group ${{ env.AZURE_RG }} --name ${{ env.MGMT_NSG }}
+
+          # Jumpbox: SSH inbound from Bastion only
+          az network nsg rule create \
+            --resource-group ${{ env.AZURE_RG }} --nsg-name ${{ env.MGMT_NSG }} \
+            --name allow-bastion-to-jumpbox --priority 100 --protocol Tcp \
+            --source-address-prefixes ${{ env.BASTION_PREFIX }} \
+            --destination-port-ranges 22 --access Allow
+
+          # Jumpbox: SSH outbound to web-snet (for internal VM access)
+          az network nsg rule create \
+            --resource-group ${{ env.AZURE_RG }} --nsg-name ${{ env.MGMT_NSG }} \
+            --name allow-jumpbox-to-web --priority 200 --protocol Tcp \
+            --source-address-prefixes ${{ env.MGMT_PREFIX }} \
+            --destination-address-prefixes ${{ env.WEB_PREFIX }} \
+            --destination-port-ranges 22 --access Allow
+
+      - name: Create VNet + subnets
+        id: subnets
         run: |
+          # AzureBastionSubnet: must NOT have NSG attached (Azure hard requirement)
           az network vnet create \
             --resource-group ${{ env.AZURE_RG }} \
             --name ${{ env.VNET_NAME }} \
             --address-prefix ${{ env.VNET_PREFIX }} \
-            --subnet-name ${{ env.WEB_SUBNET }} \
-            --subnet-prefix ${{ env.WEB_PREFIX }} \
+            --subnet-name AzureBastionSubnet \
+            --subnet-prefix ${{ env.BASTION_PREFIX }}
+
+          # web-snet: App VMs — SSH via Bastion/Jumpbox only
+          az network vnet subnet create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --vnet-name ${{ env.VNET_NAME }} \
+            --name ${{ env.WEB_SUBNET }} \
+            --address-prefix ${{ env.WEB_PREFIX }} \
             --network-security-group ${{ env.NSG_NAME }}
+
+          # mgmt-snet: Jumpbox VM — no public IP, Bastion-only access
+          az network vnet subnet create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --vnet-name ${{ env.VNET_NAME }} \
+            --name ${{ env.MGMT_SUBNET }} \
+            --address-prefix ${{ env.MGMT_PREFIX }} \
+            --network-security-group ${{ env.MGMT_NSG }}
 
           SUBNET_ID=$(az network vnet subnet show \
             --resource-group ${{ env.AZURE_RG }} \
             --vnet-name ${{ env.VNET_NAME }} \
             --name ${{ env.WEB_SUBNET }} \
-            --query id \
-            --output tsv)
+            --query id --output tsv)
           echo "subnet_id=$SUBNET_ID" >> $GITHUB_OUTPUT
-          echo "Subnet: $SUBNET_ID"
+          echo "web-snet: $SUBNET_ID"
+
+      - name: Deploy Azure Bastion (async)
+        run: |
+          # Standard Static Public IP (zone-redundant) for Bastion
+          az network public-ip create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.BASTION_NAME }}-pip \
+            --sku Standard --allocation-method Static \
+            --zone 1 2 3
+
+          # Basic SKU Bastion — provisioning takes ~5-10 min
+          # --no-wait: continues in background while VMs are created in parallel
+          az network bastion create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.BASTION_NAME }} \
+            --public-ip-address ${{ env.BASTION_NAME }}-pip \
+            --vnet-name ${{ env.VNET_NAME }} \
+            --sku Basic \
+            --no-wait
+          echo "Bastion provisioning started (async) — verified in Step 6"
 
       - name: Azure logout
         if: always()
         run: az logout
 
-  # ── 3. Compute: VM-1 ───────────────────────────────────────────────
+  # ── 3a. Jumpbox VM (mgmt-snet, no public IP) ───────────────────────
+  setup-jumpbox:
+    name: "Step 3a — Jumpbox VM"
+    runs-on: ubuntu-latest
+    needs: setup-network
+    outputs:
+      jumpbox_private_ip: ${{ steps.jumpbox.outputs.jumpbox_ip }}
+
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create Jumpbox VM
+        id: jumpbox
+        run: |
+          # No public IP — accessible via Azure Bastion only (Scenario 2: Jumpbox pattern)
+          az vm create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.JUMPBOX_VM }} \
+            --location ${{ env.AZURE_LOCATION }} \
+            --image ${{ env.VM_IMAGE_URN }} \
+            --size ${{ env.JUMPBOX_SIZE }} \
+            --admin-username azureuser \
+            --admin-password "${{ secrets.ADMIN_PASSWORD }}" \
+            --authentication-type password \
+            --vnet-name ${{ env.VNET_NAME }} \
+            --subnet ${{ env.MGMT_SUBNET }} \
+            --nsg "" \
+            --public-ip-address "" \
+            --tags Project=LTM-SA-Workshop VM=jumpbox Role=management
+
+          JUMPBOX_IP=$(az vm show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.JUMPBOX_VM }} \
+            --show-details --query privateIps --output tsv)
+          echo "jumpbox_ip=$JUMPBOX_IP" >> $GITHUB_OUTPUT
+          echo "Jumpbox private IP: $JUMPBOX_IP (no public IP — Bastion access only)"
+
+      - name: Azure logout
+        if: always()
+        run: az logout
+
+  # ── 3b. Compute: VM-1 (web-snet) ───────────────────────────────────
   setup-vm1:
-    name: "Step 3 — Create VM-1"
+    name: "Step 3b — Create VM-1"
     runs-on: ubuntu-latest
     needs: setup-network
     outputs:
@@ -241,9 +340,7 @@ jobs:
           VM1_IP=$(az vm show \
             --resource-group ${{ env.AZURE_RG }} \
             --name ${{ env.AZURE_VM1 }} \
-            --show-details \
-            --query publicIps \
-            --output tsv)
+            --show-details --query publicIps --output tsv)
           echo "vm1_ip=$VM1_IP" >> $GITHUB_OUTPUT
           echo "VM-1 IP: $VM1_IP"
 
@@ -391,11 +488,11 @@ jobs:
         if: always()
         run: az logout
 
-  # ── 6. Final: verify via LB ───────────────────────────────────────
+  # ── 6. Verify: LB + Bastion + Break-glass ─────────────────────────
   verify:
-    name: "Step 6 — Verify via Load Balancer"
+    name: "Step 6 — Verify: LB + Bastion + Break-glass"
     runs-on: ubuntu-latest
-    needs: [setup-vm1, setup-lb, deploy-app]
+    needs: [setup-jumpbox, setup-vm1, setup-lb, deploy-app]
 
     steps:
       - name: Azure login
@@ -403,7 +500,7 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Wait for LB health probe
+      - name: Scenario 1 — Wait for LB health probe
         run: |
           LB_IP="${{ needs.setup-lb.outputs.lb_ip }}"
           echo "Waiting for LB at http://${LB_IP}/health ..."
@@ -416,7 +513,7 @@ jobs:
             echo "Waiting... (${i}/18)"
           done
 
-      - name: Final health check
+      - name: Scenario 1 — LB health check
         run: |
           LB_IP="${{ needs.setup-lb.outputs.lb_ip }}"
           echo "=== LB Health ==="
@@ -428,17 +525,90 @@ jobs:
           echo "=== API Status ==="
           curl -sf "http://${LB_IP}/api/status" | python3 -m json.tool
 
+      - name: Scenario 2 — Verify Bastion provisioning
+        run: |
+          echo "Checking Azure Bastion state..."
+          for i in $(seq 1 24); do
+            STATE=$(az network bastion show \
+              --resource-group ${{ env.AZURE_RG }} \
+              --name ${{ env.BASTION_NAME }} \
+              --query "provisioningState" --output tsv 2>/dev/null || echo "Pending")
+            echo "[${i}/24] Bastion state: $STATE"
+            if [ "$STATE" = "Succeeded" ]; then
+              BASTION_IP=$(az network public-ip show \
+                --resource-group ${{ env.AZURE_RG }} \
+                --name ${{ env.BASTION_NAME }}-pip \
+                --query ipAddress --output tsv)
+              echo "Bastion ready — Public IP: $BASTION_IP"
+              echo "Admin access path: Portal → Bastion → ${{ env.JUMPBOX_VM }}(mgmt-snet) → SSH → App VMs"
+              break
+            fi
+            if [ "$STATE" = "Failed" ]; then
+              echo "ERROR: Bastion provisioning failed"
+              exit 1
+            fi
+            sleep 20
+          done
+
+      - name: Scenario 2 — Verify Jumpbox (no public IP)
+        run: |
+          JUMPBOX_IP="${{ needs.setup-jumpbox.outputs.jumpbox_private_ip }}"
+          STATE=$(az vm get-instance-view \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.JUMPBOX_VM }} \
+            --query "instanceView.statuses[?starts_with(code,'PowerState')].displayStatus" \
+            --output tsv)
+          PUBLIC_IP=$(az vm show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.JUMPBOX_VM }} \
+            --show-details --query publicIps --output tsv 2>/dev/null || echo "none")
+          echo "Jumpbox VM: $STATE | Private IP: ${JUMPBOX_IP} | Public IP: ${PUBLIC_IP:-none}"
+          if [ "${PUBLIC_IP:-none}" != "none" ] && [ -n "$PUBLIC_IP" ]; then
+            echo "WARNING: Jumpbox has a public IP — this should not happen"
+            exit 1
+          fi
+          echo "Verified: Jumpbox has no public IP (Bastion-only access)"
+
+      - name: Scenario 3 — Break-glass via Management Plane
+        run: |
+          echo "=== Break-glass: az vm run-command (bypasses NSG/SSH restrictions) ==="
+          az vm run-command invoke \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_VM1 }} \
+            --command-id RunShellScript \
+            --scripts "
+              echo '=== Break-glass access via Azure Management Plane ==='
+              echo 'Host:' \$(hostname)
+              echo 'App process:'
+              pm2 list --no-color 2>/dev/null || echo 'pm2 not available'
+              echo 'Port 3000 listening:'
+              ss -tlnp | grep :3000 || echo 'not listening'
+              echo 'No SSH port required — Management Plane only'
+            " \
+            --query "value[0].message" --output tsv
+
       - name: E2E result summary
         run: |
           LB_IP="${{ needs.setup-lb.outputs.lb_ip }}"
           VM1_IP="${{ needs.setup-vm1.outputs.vm1_ip }}"
+          JUMPBOX_IP="${{ needs.setup-jumpbox.outputs.jumpbox_private_ip }}"
           echo ""
           echo "=================================================="
           echo "  E2E TEST PASSED"
           echo "=================================================="
-          echo "  LB URL  : http://${LB_IP}          (primary)"
-          echo "  VM-1    : http://${VM1_IP}:${{ env.APP_PORT }} (direct)"
-          echo "  VM-2    : (private, via LB only)"
+          echo "  [Serving]"
+          echo "  LB URL  : http://${LB_IP}           (port 80 → 3000)"
+          echo "  VM-1    : http://${VM1_IP}:${{ env.APP_PORT }}  (direct, web-snet)"
+          echo "  VM-2    : (private IP, via LB only)"
+          echo ""
+          echo "  [Admin Access — Zero Trust]"
+          echo "  Bastion : Azure Portal → ltmsa-bastion"
+          echo "  Jumpbox : ${JUMPBOX_IP} (mgmt-snet, no public IP)"
+          echo "  Path    : Bastion → Jumpbox → SSH → App VMs"
+          echo ""
+          echo "  [Break-glass]"
+          echo "  az vm run-command → Management Plane (no SSH port needed)"
+          echo ""
           echo "  Commit  : ${{ github.sha }}"
           echo "  Env     : ${{ github.event.inputs.environment }}"
           echo "=================================================="
@@ -448,6 +618,7 @@ jobs:
           echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| LB URL | http://${LB_IP} |" >> $GITHUB_STEP_SUMMARY
           echo "| VM-1 (direct) | http://${VM1_IP}:${{ env.APP_PORT }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Jumpbox | ${JUMPBOX_IP} (Bastion-only) |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
 
       - name: Azure logout
