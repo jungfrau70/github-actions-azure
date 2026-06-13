@@ -122,18 +122,19 @@ jobs:
           echo "Deleting ${{ env.AZURE_RG }} ..."
           az group delete --name ${{ env.AZURE_RG }} --yes --no-wait
 
-          echo "Waiting for deletion (up to 10 min)..."
-          for i in $(seq 1 30); do
-            sleep 20
+          # Bastion deletion alone can take 15-20 min — wait up to 30 min total
+          echo "Waiting for deletion (up to 30 min)..."
+          for i in $(seq 1 60); do
+            sleep 30
             STILL=$(az group exists --name ${{ env.AZURE_RG }})
-            echo "[$i/30] Exists: $STILL"
+            echo "[$i/60] Exists: $STILL"
             if [ "$STILL" == "false" ]; then
               echo "Resource group deleted."
               exit 0
             fi
           done
 
-          echo "ERROR: ${{ env.AZURE_RG }} still exists after 10 min — check for remaining locks or dependencies"
+          echo "ERROR: ${{ env.AZURE_RG }} still exists after 30 min — check for remaining locks or dependencies"
           exit 1
 
       - name: Azure logout
