@@ -50,20 +50,24 @@ on:
 env:
   AZURE_RG:       ltmsa-security-rg
   AZURE_LOCATION: koreacentral
-  VNET_NAME:      ltmsa-vnet
-  VNET_PREFIX:    10.0.0.0/16
+  # ── Hub VNet (Bastion + Jumpbox — shared services) ───────────────
+  HUB_VNET_NAME:   ltmsa-hub-vnet
+  HUB_VNET_PREFIX: 10.0.0.0/16
   # AzureBastionSubnet: required name, min /26, NO NSG allowed
-  BASTION_NAME:   ltmsa-bastion
-  BASTION_PREFIX: 10.0.0.0/26
+  BASTION_NAME:    ltmsa-bastion
+  BASTION_PREFIX:  10.0.0.0/26
   # mgmt-snet: Jumpbox VM (no public IP, SSH from Bastion only)
-  MGMT_SUBNET:    mgmt-snet
-  MGMT_PREFIX:    10.0.2.0/24
-  MGMT_NSG:       ltmsa-mgmt-nsg
-  JUMPBOX_VM:     ltmsa-jumpbox
-  JUMPBOX_SIZE:   Standard_D2s_v3  # B2s/DS2v2 unavailable in KoreaCentral; D2s_v3 confirmed available
-  # web-snet: App VMs (SSH from Bastion/Jumpbox only — no internet SSH)
+  MGMT_SUBNET:     mgmt-snet
+  MGMT_PREFIX:     10.0.1.0/24
+  MGMT_NSG:        ltmsa-mgmt-nsg
+  JUMPBOX_VM:      ltmsa-jumpbox
+  JUMPBOX_SIZE:    Standard_D2s_v3  # B2s/DS2v2 unavailable in KoreaCentral; D2s_v3 confirmed available
+  # ── Spoke VNet (App VMs + LB — workload tier) ────────────────────
+  SPOKE_VNET_NAME:   ltmsa-spoke-vnet
+  SPOKE_VNET_PREFIX: 10.1.0.0/16
+  # web-snet: App VMs (SSH via Hub Bastion/Jumpbox through VNet Peering — no internet SSH)
   WEB_SUBNET:     web-snet
-  WEB_PREFIX:     10.0.1.0/24
+  WEB_PREFIX:     10.1.1.0/24
   NSG_NAME:       ltmsa-web-nsg
   AZURE_VM1:      ltmsa-demo-vm
   AZURE_VM2:      ltmsa-demo-vm-2
@@ -141,13 +145,13 @@ jobs:
         if: always()
         run: az logout
 
-  # ── 2. Network: VNet + NSGs + Bastion ──────────────────────────────
+  # ── 2. Network: Hub-Spoke VNets + NSGs + Peering + Bastion ──────────
   setup-network:
-    name: "Step 2 — VNet + NSG + Bastion"
+    name: "Step 2 — Hub-Spoke VNet + NSG + Peering + Bastion"
     runs-on: ubuntu-latest
     needs: cleanup
     outputs:
-      subnet_id: ${{ steps.subnets.outputs.subnet_id }}
+      spoke_subnet_id: ${{ steps.subnets.outputs.spoke_subnet_id }}
 
     steps:
       - name: Azure login
@@ -166,24 +170,25 @@ jobs:
 
       - name: Create NSGs
         run: |
-          # ── web-snet NSG (App VMs) ────────────────────────────────
+          # ── Spoke web-snet NSG (App VMs) ─────────────────────────
+          # Source IPs are from Hub VNet — traffic arrives through VNet Peering
           az network nsg create --resource-group ${{ env.AZURE_RG }} --name ${{ env.NSG_NAME }}
 
-          # SSH from AzureBastionSubnet only — internet-facing SSH removed (Zero Trust)
+          # SSH from Hub AzureBastionSubnet (Bastion reaches Spoke VMs via peering)
           az network nsg rule create \
             --resource-group ${{ env.AZURE_RG }} --nsg-name ${{ env.NSG_NAME }} \
             --name allow-bastion-ssh --priority 100 --protocol Tcp \
             --source-address-prefixes ${{ env.BASTION_PREFIX }} \
             --destination-port-ranges 22 --access Allow
 
-          # SSH from Jumpbox (mgmt-snet → web-snet lateral movement via Jumpbox)
+          # SSH from Hub mgmt-snet Jumpbox (Jumpbox → Spoke VMs via peering)
           az network nsg rule create \
             --resource-group ${{ env.AZURE_RG }} --nsg-name ${{ env.NSG_NAME }} \
             --name allow-jumpbox-ssh --priority 110 --protocol Tcp \
             --source-address-prefixes ${{ env.MGMT_PREFIX }} \
             --destination-port-ranges 22 --access Allow
 
-          # App port 3000 (from LB health probe + direct access)
+          # App port 3000 (LB health probe + internet direct)
           az network nsg rule create \
             --resource-group ${{ env.AZURE_RG }} --nsg-name ${{ env.NSG_NAME }} \
             --name allow-app-3000 --priority 200 --protocol Tcp \
@@ -202,7 +207,7 @@ jobs:
             --source-address-prefixes AzureLoadBalancer \
             --destination-port-ranges "*" --access Allow
 
-          # ── mgmt-snet NSG (Jumpbox) ───────────────────────────────
+          # ── Hub mgmt-snet NSG (Jumpbox) ───────────────────────────
           az network nsg create --resource-group ${{ env.AZURE_RG }} --name ${{ env.MGMT_NSG }}
 
           # Jumpbox: SSH inbound from Bastion only
@@ -212,78 +217,125 @@ jobs:
             --source-address-prefixes ${{ env.BASTION_PREFIX }} \
             --destination-port-ranges 22 --access Allow
 
-          # Jumpbox: SSH outbound to web-snet (explicit — Azure default AllowVnetOutBound covers this,
-          #   but specifying direction=Outbound makes the intent auditable and policy-reviewable)
+          # Jumpbox: SSH outbound to Spoke web-snet (explicit for auditability)
+          # Azure default AllowVnetOutBound covers peered VNets; this rule makes
+          # the intent reviewable in compliance/policy tools
           az network nsg rule create \
             --resource-group ${{ env.AZURE_RG }} --nsg-name ${{ env.MGMT_NSG }} \
-            --name allow-jumpbox-to-web --priority 200 --protocol Tcp \
+            --name allow-jumpbox-to-spoke --priority 200 --protocol Tcp \
             --direction Outbound \
             --source-address-prefixes ${{ env.MGMT_PREFIX }} \
             --destination-address-prefixes ${{ env.WEB_PREFIX }} \
             --destination-port-ranges 22 --access Allow
 
-      - name: Create VNet + subnets
-        id: subnets
+      - name: Create Hub VNet + subnets
         run: |
-          # AzureBastionSubnet: must NOT have NSG attached (Azure hard requirement)
+          # Hub VNet — shared services: Bastion + Jumpbox
           az network vnet create \
             --resource-group ${{ env.AZURE_RG }} \
-            --name ${{ env.VNET_NAME }} \
-            --address-prefix ${{ env.VNET_PREFIX }} \
+            --name ${{ env.HUB_VNET_NAME }} \
+            --address-prefix ${{ env.HUB_VNET_PREFIX }} \
             --subnet-name AzureBastionSubnet \
             --subnet-prefix ${{ env.BASTION_PREFIX }}
+          echo "Hub VNet created: ${{ env.HUB_VNET_NAME }} (${{ env.HUB_VNET_PREFIX }})"
 
-          # web-snet: App VMs — SSH via Bastion/Jumpbox only
+          # mgmt-snet in Hub: Jumpbox VM (Bastion-only access, no public IP)
           az network vnet subnet create \
             --resource-group ${{ env.AZURE_RG }} \
-            --vnet-name ${{ env.VNET_NAME }} \
-            --name ${{ env.WEB_SUBNET }} \
-            --address-prefix ${{ env.WEB_PREFIX }} \
-            --network-security-group ${{ env.NSG_NAME }}
-
-          # mgmt-snet: Jumpbox VM — no public IP, Bastion-only access
-          az network vnet subnet create \
-            --resource-group ${{ env.AZURE_RG }} \
-            --vnet-name ${{ env.VNET_NAME }} \
+            --vnet-name ${{ env.HUB_VNET_NAME }} \
             --name ${{ env.MGMT_SUBNET }} \
             --address-prefix ${{ env.MGMT_PREFIX }} \
             --network-security-group ${{ env.MGMT_NSG }}
+          echo "Hub mgmt-snet created: ${{ env.MGMT_PREFIX }}"
 
-          SUBNET_ID=$(az network vnet subnet show \
+      - name: Create Spoke VNet + subnets
+        id: subnets
+        run: |
+          # Spoke VNet — workload tier: App VMs + LB
+          az network vnet create \
             --resource-group ${{ env.AZURE_RG }} \
-            --vnet-name ${{ env.VNET_NAME }} \
+            --name ${{ env.SPOKE_VNET_NAME }} \
+            --address-prefix ${{ env.SPOKE_VNET_PREFIX }}
+          echo "Spoke VNet created: ${{ env.SPOKE_VNET_NAME }} (${{ env.SPOKE_VNET_PREFIX }})"
+
+          # web-snet in Spoke: App VMs (SSH via Hub Bastion/Jumpbox through peering)
+          az network vnet subnet create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --vnet-name ${{ env.SPOKE_VNET_NAME }} \
+            --name ${{ env.WEB_SUBNET }} \
+            --address-prefix ${{ env.WEB_PREFIX }} \
+            --network-security-group ${{ env.NSG_NAME }}
+          echo "Spoke web-snet created: ${{ env.WEB_PREFIX }}"
+
+          SPOKE_SUBNET_ID=$(az network vnet subnet show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --vnet-name ${{ env.SPOKE_VNET_NAME }} \
             --name ${{ env.WEB_SUBNET }} \
             --query id --output tsv)
-          echo "subnet_id=$SUBNET_ID" >> $GITHUB_OUTPUT
-          echo "web-snet: $SUBNET_ID"
+          echo "spoke_subnet_id=$SPOKE_SUBNET_ID" >> $GITHUB_OUTPUT
+          echo "Spoke web-snet ID: $SPOKE_SUBNET_ID"
 
-      - name: Deploy Azure Bastion (async)
+      - name: Create VNet Peering (Hub ↔ Spoke)
         run: |
-          # Standard Static Public IP (zone-redundant) for Bastion
+          HUB_ID=$(az network vnet show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.HUB_VNET_NAME }} \
+            --query id --output tsv)
+          SPOKE_ID=$(az network vnet show \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.SPOKE_VNET_NAME }} \
+            --query id --output tsv)
+
+          # Hub → Spoke peering (allows Bastion/Jumpbox to reach Spoke workloads)
+          az network vnet peering create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name hub-to-spoke \
+            --vnet-name ${{ env.HUB_VNET_NAME }} \
+            --remote-vnet "$SPOKE_ID" \
+            --allow-vnet-access \
+            --allow-forwarded-traffic
+          echo "Peering Hub→Spoke created"
+
+          # Spoke → Hub peering (allows return traffic + Spoke to reach Hub services)
+          az network vnet peering create \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name spoke-to-hub \
+            --vnet-name ${{ env.SPOKE_VNET_NAME }} \
+            --remote-vnet "$HUB_ID" \
+            --allow-vnet-access \
+            --allow-forwarded-traffic
+          echo "Peering Spoke→Hub created"
+
+          echo "VNet Peering established: Hub (${{ env.HUB_VNET_PREFIX }}) ↔ Spoke (${{ env.SPOKE_VNET_PREFIX }})"
+
+      - name: Deploy Azure Bastion in Hub (async)
+        run: |
+          # Standard Static zone-redundant Public IP for Bastion (in Hub VNet)
           az network public-ip create \
             --resource-group ${{ env.AZURE_RG }} \
             --name ${{ env.BASTION_NAME }}-pip \
             --sku Standard --allocation-method Static \
             --zone 1 2 3
 
-          # Basic SKU Bastion — provisioning takes ~5-10 min
+          # Basic SKU Bastion in Hub AzureBastionSubnet
+          # Bastion reaches Spoke VMs through VNet Peering (no public SSH needed on Spoke VMs)
           # --no-wait: continues in background while VMs are created in parallel
           az network bastion create \
             --resource-group ${{ env.AZURE_RG }} \
             --name ${{ env.BASTION_NAME }} \
             --public-ip-address ${{ env.BASTION_NAME }}-pip \
-            --vnet-name ${{ env.VNET_NAME }} \
+            --vnet-name ${{ env.HUB_VNET_NAME }} \
             --sku Basic \
             --no-wait
-          echo "Bastion provisioning started (async) — verified in Step 6"
+          echo "Bastion provisioning started in Hub (async) — verified in Step 6"
 
       - name: Azure logout
         if: always()
         run: az logout
 
-  # ── 3a. Jumpbox VM (mgmt-snet, no public IP) ───────────────────────
+  # ── 3a. Jumpbox VM (Hub mgmt-snet, no public IP) ──────────────────
   setup-jumpbox:
-    name: "Step 3a — Jumpbox VM"
+    name: "Step 3a — Jumpbox VM (Hub)"
     runs-on: ubuntu-latest
     needs: setup-network
     outputs:
@@ -295,10 +347,12 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Create Jumpbox VM
+      - name: Create Jumpbox VM in Hub mgmt-snet
         id: jumpbox
         run: |
-          # No public IP — accessible via Azure Bastion only (Scenario 2: Jumpbox pattern)
+          # Jumpbox lives in Hub VNet (mgmt-snet) — no public IP
+          # Access path: Bastion (Hub AzureBastionSubnet) → Jumpbox (Hub mgmt-snet)
+          #              → SSH → App VMs (Spoke web-snet) via VNet Peering
           az vm create \
             --resource-group ${{ env.AZURE_RG }} \
             --name ${{ env.JUMPBOX_VM }} \
@@ -308,11 +362,11 @@ jobs:
             --admin-username azureuser \
             --admin-password "${{ secrets.ADMIN_PASSWORD }}" \
             --authentication-type password \
-            --vnet-name ${{ env.VNET_NAME }} \
+            --vnet-name ${{ env.HUB_VNET_NAME }} \
             --subnet ${{ env.MGMT_SUBNET }} \
             --nsg "" \
             --public-ip-address "" \
-            --tags Project=LTM-SA-Workshop VM=jumpbox Role=management
+            --tags Project=LTM-SA-Workshop VM=jumpbox Role=management VNet=Hub
 
           JUMPBOX_IP=$(az vm show \
             --resource-group ${{ env.AZURE_RG }} \
@@ -325,9 +379,9 @@ jobs:
         if: always()
         run: az logout
 
-  # ── 3b. Compute: VM-1 (web-snet) ───────────────────────────────────
+  # ── 3b. Compute: VM-1 (Spoke web-snet) ────────────────────────────
   setup-vm1:
-    name: "Step 3b — Create VM-1"
+    name: "Step 3b — Create VM-1 (Spoke)"
     runs-on: ubuntu-latest
     needs: setup-network
     outputs:
@@ -339,9 +393,11 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Create VM-1
+      - name: Create VM-1 in Spoke web-snet
         id: vm1
         run: |
+          # App VM in Spoke VNet (web-snet) — workload tier
+          # SSH access: Bastion (Hub) → via VNet Peering → VM (Spoke)
           az vm create \
             --resource-group ${{ env.AZURE_RG }} \
             --name ${{ env.AZURE_VM1 }} \
@@ -351,11 +407,11 @@ jobs:
             --admin-username azureuser \
             --admin-password "${{ secrets.ADMIN_PASSWORD }}" \
             --authentication-type password \
-            --vnet-name ${{ env.VNET_NAME }} \
+            --vnet-name ${{ env.SPOKE_VNET_NAME }} \
             --subnet ${{ env.WEB_SUBNET }} \
             --nsg "" \
             --public-ip-sku Standard \
-            --tags Project=LTM-SA-Workshop VM=primary
+            --tags Project=LTM-SA-Workshop VM=primary VNet=Spoke
 
           VM1_IP=$(az vm show \
             --resource-group ${{ env.AZURE_RG }} \
@@ -384,14 +440,14 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy lb-vm2.bicep
+      - name: Deploy lb-vm2.bicep (Spoke web-snet)
         id: bicep
         run: |
           RESULT=$(az deployment group create \
             --resource-group ${{ env.AZURE_RG }} \
             --template-file bicep/lb-vm2.bicep \
             --parameters adminPassword="${{ secrets.ADMIN_PASSWORD }}" \
-                         subnetId="${{ needs.setup-network.outputs.subnet_id }}" \
+                         subnetId="${{ needs.setup-network.outputs.spoke_subnet_id }}" \
             --query properties.outputs \
             --output json)
 
@@ -563,9 +619,9 @@ jobs:
           echo "=== API Status ==="
           curl -sf "http://${LB_IP}/api/status" | python3 -m json.tool
 
-      - name: Scenario 2 — Verify Bastion provisioning
+      - name: Scenario 2 — Verify Bastion provisioning (Hub VNet)
         run: |
-          echo "Checking Azure Bastion state (max 15 min)..."
+          echo "Checking Azure Bastion state in Hub VNet (max 15 min)..."
           BASTION_READY=false
           for i in $(seq 1 30); do
             STATE=$(az network bastion show \
@@ -578,8 +634,11 @@ jobs:
                 --resource-group ${{ env.AZURE_RG }} \
                 --name ${{ env.BASTION_NAME }}-pip \
                 --query ipAddress --output tsv)
-              echo "Bastion ready — Public IP: $BASTION_IP"
-              echo "Admin access path: Portal → Bastion → ${{ env.JUMPBOX_VM }}(mgmt-snet) → SSH → App VMs"
+              echo "Bastion ready in Hub — Public IP: $BASTION_IP"
+              echo "Admin access path (Hub-Spoke):"
+              echo "  Portal → Bastion (Hub AzureBastionSubnet ${{ env.BASTION_PREFIX }})"
+              echo "         → [VNet Peering] → App VMs (Spoke web-snet ${{ env.WEB_PREFIX }})"
+              echo "  OR: Bastion → Jumpbox (Hub mgmt-snet ${{ env.MGMT_PREFIX }}) → SSH → App VMs"
               BASTION_READY=true
               break
             fi
@@ -638,31 +697,42 @@ jobs:
           JUMPBOX_IP="${{ needs.setup-jumpbox.outputs.jumpbox_private_ip }}"
           echo ""
           echo "=================================================="
-          echo "  E2E TEST PASSED"
+          echo "  E2E TEST PASSED — Hub-Spoke Architecture"
           echo "=================================================="
-          echo "  [Serving]"
-          echo "  LB URL  : http://${LB_IP}           (port 80 → 3000)"
-          echo "  VM-1    : http://${VM1_IP}:${{ env.APP_PORT }}  (direct, web-snet)"
-          echo "  VM-2    : (private IP, via LB only)"
+          echo "  [Network: Hub-Spoke VNet Peering]"
+          echo "  Hub VNet   : ${{ env.HUB_VNET_NAME }} (${{ env.HUB_VNET_PREFIX }})"
+          echo "    AzureBastionSubnet: ${{ env.BASTION_PREFIX }}"
+          echo "    mgmt-snet         : ${{ env.MGMT_PREFIX }} (Jumpbox)"
+          echo "  Spoke VNet : ${{ env.SPOKE_VNET_NAME }} (${{ env.SPOKE_VNET_PREFIX }})"
+          echo "    web-snet          : ${{ env.WEB_PREFIX }} (App VMs + LB)"
+          echo "  Peering    : hub-to-spoke + spoke-to-hub (bidirectional)"
           echo ""
-          echo "  [Admin Access — Zero Trust]"
-          echo "  Bastion : Azure Portal → ltmsa-bastion"
-          echo "  Jumpbox : ${JUMPBOX_IP} (mgmt-snet, no public IP)"
-          echo "  Path    : Bastion → Jumpbox → SSH → App VMs"
+          echo "  [Serving — Spoke workload tier]"
+          echo "  LB URL  : http://${LB_IP}          (port 80 → 3000)"
+          echo "  VM-1    : http://${VM1_IP}:${{ env.APP_PORT }} (direct, Spoke web-snet)"
+          echo "  VM-2    : (private IP, via LB only, Spoke web-snet)"
+          echo ""
+          echo "  [Admin Access — Hub-Spoke Zero Trust]"
+          echo "  Bastion : Azure Portal → ltmsa-bastion (Hub)"
+          echo "  Jumpbox : ${JUMPBOX_IP} (Hub mgmt-snet, no public IP)"
+          echo "  Path 1  : Bastion (Hub) → [Peering] → App VMs (Spoke)"
+          echo "  Path 2  : Bastion (Hub) → Jumpbox (Hub mgmt-snet) → [Peering] → App VMs (Spoke)"
           echo ""
           echo "  [Break-glass]"
-          echo "  az vm run-command → Management Plane (no SSH port needed)"
+          echo "  az vm run-command → Management Plane (no SSH port, no network path needed)"
           echo ""
           echo "  Commit  : ${{ github.sha }}"
           echo "  Env     : ${{ github.event.inputs.environment }}"
           echo "=================================================="
 
-          echo "### E2E Test Passed" >> $GITHUB_STEP_SUMMARY
+          echo "### E2E Test Passed — Hub-Spoke" >> $GITHUB_STEP_SUMMARY
           echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Hub VNet | ${{ env.HUB_VNET_NAME }} (${{ env.HUB_VNET_PREFIX }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Spoke VNet | ${{ env.SPOKE_VNET_NAME }} (${{ env.SPOKE_VNET_PREFIX }}) |" >> $GITHUB_STEP_SUMMARY
           echo "| LB URL | http://${LB_IP} |" >> $GITHUB_STEP_SUMMARY
           echo "| VM-1 (direct) | http://${VM1_IP}:${{ env.APP_PORT }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Jumpbox | ${JUMPBOX_IP} (Bastion-only) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Jumpbox | ${JUMPBOX_IP} (Hub mgmt-snet, Bastion-only) |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
 
       - name: Azure logout
