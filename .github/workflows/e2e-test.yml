@@ -569,15 +569,15 @@ jobs:
               echo '${APP_B64}' | base64 -d > app.js
               echo '${PKG_B64}' | base64 -d > package.json
               npm install --production --silent
-              if pm2 describe ltm-workshop &>/dev/null; then
-                pm2 restart ltm-workshop --update-env
-              else
-                PORT=${APP_PORT} APP_VERSION=${APP_VERSION} \
-                  pm2 start app.js --name ltm-workshop
-              fi
+              # Stop any existing pm2 daemon so systemd can take ownership cleanly
+              pm2 kill 2>/dev/null || true
+              # Load app into pm2 and persist the process list
+              PORT=${APP_PORT} APP_VERSION=${APP_VERSION} \
+                pm2 start app.js --name ltm-workshop
               pm2 save --force
-              # enable pm2-root for reboot persistence — do NOT restart (ExecStop runs pm2 kill which would kill our app)
-              systemctl enable pm2-root 2>/dev/null || true
+              # Hand pm2 daemon over to systemd — systemd owns restart/recovery from here
+              # (pm2-root.service: ExecStart=pm2 resurrect, Restart=on-failure)
+              systemctl enable --now pm2-root 2>/dev/null || true
               for i in \$(seq 1 6); do
                 sleep 5
                 if curl -sf --max-time 10 http://localhost:${APP_PORT}/health >/dev/null; then
@@ -611,26 +611,32 @@ jobs:
         run: |
           LB_IP="${{ needs.setup-lb.outputs.lb_ip }}"
           echo "Waiting for LB at http://${LB_IP}/health ..."
+          LB_HEALTHY=false
           for i in $(seq 1 18); do
             sleep 10
             if curl -sf --max-time 10 "http://${LB_IP}/health" >/dev/null 2>&1; then
               echo "LB is healthy (attempt ${i}/18)"
+              LB_HEALTHY=true
               break
             fi
             echo "Waiting... (${i}/18)"
           done
+          if [ "$LB_HEALTHY" = "false" ]; then
+            echo "ERROR: LB not healthy after 3 minutes — backend VMs may be down"
+            exit 1
+          fi
 
       - name: Scenario 1 — LB health check
         run: |
           LB_IP="${{ needs.setup-lb.outputs.lb_ip }}"
           echo "=== LB Health ==="
-          curl -sf "http://${LB_IP}/health" | python3 -m json.tool
+          curl -sf --max-time 30 "http://${LB_IP}/health" | python3 -m json.tool
           echo ""
           echo "=== API Modules ==="
-          curl -sf "http://${LB_IP}/api/modules" | python3 -m json.tool
+          curl -sf --max-time 30 "http://${LB_IP}/api/modules" | python3 -m json.tool
           echo ""
           echo "=== API Status ==="
-          curl -sf "http://${LB_IP}/api/status" | python3 -m json.tool
+          curl -sf --max-time 30 "http://${LB_IP}/api/status" | python3 -m json.tool
 
       - name: Scenario 2 — Verify Bastion provisioning (Hub VNet)
         run: |
