@@ -292,8 +292,8 @@ jobs:
             --name hub-to-spoke \
             --vnet-name ${{ env.HUB_VNET_NAME }} \
             --remote-vnet "$SPOKE_ID" \
-            --allow-vnet-access \
-            --allow-forwarded-traffic
+            --allow-vnet-access true \
+            --allow-forwarded-traffic true
           echo "Peering Hub→Spoke created"
 
           # Spoke → Hub peering (allows return traffic + Spoke to reach Hub services)
@@ -302,8 +302,8 @@ jobs:
             --name spoke-to-hub \
             --vnet-name ${{ env.SPOKE_VNET_NAME }} \
             --remote-vnet "$HUB_ID" \
-            --allow-vnet-access \
-            --allow-forwarded-traffic
+            --allow-vnet-access true \
+            --allow-forwarded-traffic true
           echo "Peering Spoke→Hub created"
 
           echo "VNet Peering established: Hub (${{ env.HUB_VNET_PREFIX }}) ↔ Spoke (${{ env.SPOKE_VNET_PREFIX }})"
