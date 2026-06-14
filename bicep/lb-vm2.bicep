@@ -42,6 +42,7 @@ resource lbPip 'Microsoft.Network/publicIPAddresses@2023-04-01' = {
   location: location
   tags: commonTags
   sku: { name: 'Standard' }
+  zones: ['1', '2', '3']   // Zone-redundant: survives single-zone failure (matches Bastion PIP config)
   properties: {
     publicIPAllocationMethod: 'Static'
     dnsSettings: {

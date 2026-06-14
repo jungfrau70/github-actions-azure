@@ -504,7 +504,7 @@ jobs:
               systemctl restart pm2-root >/dev/null 2>&1 || true
               for i in \$(seq 1 6); do
                 sleep 5
-                if curl -sf http://localhost:${APP_PORT}/health >/dev/null; then
+                if curl -sf --max-time 10 http://localhost:${APP_PORT}/health >/dev/null; then
                   echo \"[OK] ${{ matrix.vm }} healthy (attempt \${i}/6)\"
                   exit 0
                 fi
