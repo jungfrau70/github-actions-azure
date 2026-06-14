@@ -575,8 +575,9 @@ jobs:
                 PORT=${APP_PORT} APP_VERSION=${APP_VERSION} \
                   pm2 start app.js --name ltm-workshop
               fi
-              pm2 save --force >/dev/null
-              systemctl restart pm2-root 2>/dev/null || true
+              pm2 save --force
+              # enable pm2-root for reboot persistence — do NOT restart (ExecStop runs pm2 kill which would kill our app)
+              systemctl enable pm2-root 2>/dev/null || true
               for i in \$(seq 1 6); do
                 sleep 5
                 if curl -sf --max-time 10 http://localhost:${APP_PORT}/health >/dev/null; then
