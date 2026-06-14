@@ -46,24 +46,26 @@ app.use((req, res, next) => {
 
 // ── 워크샵 데이터 ────────────────────────────────────────────────────
 const WORKSHOP_MODULES = [
-  { id: 1, name: 'Governance & Landing Zone',     status: 'completed', layer: 'Platform / Governance' },
-  { id: 2, name: 'Network Architecture (Hub-Spoke)', status: 'completed', layer: 'Network' },
-  { id: 3, name: 'Security & Identity',           status: 'completed', layer: 'Identity' },
-  { id: 4, name: 'Cloud Resiliency & HA',         status: 'completed', layer: 'Resiliency' },
-  { id: 5, name: 'Azure Monitor & Telemetry',     status: 'completed', layer: 'Observability' },
-  { id: 6, name: 'FinOps & Cost Governance',      status: 'completed', layer: 'FinOps' },
-  { id: 7, name: 'Automation & Bicep IaC',        status: 'completed', layer: 'Automation' },
+  { id: 1, name: 'Governance & Landing Zone',        status: 'completed', layer: 'Platform / Governance' },
+  { id: 2, name: 'Network Architecture (Hub-Spoke)',  status: 'completed', layer: 'Network' },
+  { id: 3, name: 'Security & Identity',              status: 'completed', layer: 'Identity' },
+  { id: 4, name: 'Cloud Resiliency & HA',            status: 'completed', layer: 'Resiliency' },
+  { id: 5, name: 'Azure Monitor & Telemetry',        status: 'completed', layer: 'Observability' },
+  { id: 6, name: 'FinOps & Cost Governance',         status: 'completed', layer: 'FinOps' },
+  { id: 7, name: 'Automation & Bicep IaC',           status: 'completed', layer: 'Automation' },
+  { id: 8, name: 'Security Artifacts & MDC',         status: 'completed', layer: 'Security Posture' },
 ];
 
 const LANDING_ZONE_LAYERS = [
-  { layer: 'Platform',     resources: ['LTM-Corp MG', 'Korea Policy'],           module: 'Pre-work' },
-  { layer: 'Governance',   resources: ['RBAC', 'Azure Policy', 'Resource Lock'],  module: 'Module 1' },
-  { layer: 'Network',      resources: ['Hub VNet', 'Spoke VNet', 'NSG 3-tier'],   module: 'Module 2' },
-  { layer: 'Identity',     resources: ['Managed Identity', 'Key Vault'],          module: 'Module 3' },
-  { layer: 'Resiliency',   resources: ['AZ VM x2', 'Standard LB', 'Backup'],     module: 'Module 4' },
-  { layer: 'Observability',resources: ['Log Analytics', 'KQL', 'Alert Rules'],    module: 'Module 5' },
-  { layer: 'FinOps',       resources: ['Budget Alert', 'Tags', 'Advisor'],        module: 'Module 6' },
-  { layer: 'Automation',   resources: ['Bicep', 'Automation Runbook', 'CI/CD'],   module: 'Module 7' },
+  { layer: 'Platform',       resources: ['LTM-Corp MG', 'Korea Policy'],                    module: 'Pre-work' },
+  { layer: 'Governance',     resources: ['RBAC', 'Azure Policy', 'Resource Lock'],           module: 'Module 1' },
+  { layer: 'Network',        resources: ['Hub VNet', 'Spoke VNet', 'NSG 3-tier'],            module: 'Module 2' },
+  { layer: 'Identity',       resources: ['Managed Identity', 'Key Vault'],                   module: 'Module 3' },
+  { layer: 'Resiliency',     resources: ['AZ VM x2', 'Standard LB', 'Backup'],              module: 'Module 4' },
+  { layer: 'Observability',  resources: ['Log Analytics', 'KQL', 'Alert Rules'],             module: 'Module 5' },
+  { layer: 'FinOps',         resources: ['Budget Alert', 'Tags', 'Advisor'],                 module: 'Module 6' },
+  { layer: 'Automation',     resources: ['Bicep', 'GitHub Actions', 'CI/CD'],               module: 'Module 7' },
+  { layer: 'Security',       resources: ['Defender for Cloud', 'CSPM', 'CIS Benchmark'],    module: 'Module 8' },
 ];
 
 // ── 라우트 ────────────────────────────────────────────────────────────
@@ -124,9 +126,9 @@ app.get('/', (req, res) => {
 <body>
   <div class="hero">
     <h1>🏗️ LTM Korea — Azure SA Workshop</h1>
-    <p>Hub-Spoke Landing Zone · 7 Modules · GitHub Actions CI/CD</p>
+    <p>Hub-Spoke Landing Zone · 8 Modules · GitHub Actions CI/CD</p>
     <div class="badge-row">
-      <span class="pill green">✅ All 7 Modules Completed</span>
+      <span class="pill green">✅ All 8 Modules Completed</span>
       <span class="pill">v${VERSION}</span>
       <span class="pill">${ENV}</span>
       <span class="pill">Korea Central</span>
