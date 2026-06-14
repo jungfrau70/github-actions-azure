@@ -22,6 +22,9 @@ param adminPassword string
 @description('Existing web subnet ID to attach VM-2 NIC. NSG (ltmsa-web-nsg) is applied at subnet level — no NIC-level NSG needed.')
 param subnetId string
 
+@description('Base64-encoded cloud-init script (pre-installs Node.js + pm2 at VM boot)')
+param customData string = ''
+
 @description('VM size — Standard_D2s_v3 available in Korea Central')
 param vmSize string = 'Standard_D2s_v3'
 
@@ -144,6 +147,7 @@ resource vm2 'Microsoft.Compute/virtualMachines@2023-07-01' = {
       computerName: vm2Name
       adminUsername: adminUsername
       adminPassword: adminPassword
+      customData: empty(customData) ? null : customData
       linuxConfiguration: {
         disablePasswordAuthentication: false
       }

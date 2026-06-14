@@ -396,6 +396,21 @@ jobs:
       - name: Create VM-1 in Spoke web-snet
         id: vm1
         run: |
+          # cloud-init: pre-install Node.js + pm2 at boot time
+          # Runs before unattended-upgrades acquires dpkg lock → no apt race condition
+          cat > /tmp/cloud-init.yaml << 'CLOUDINIT'
+          #cloud-config
+          runcmd:
+            - systemctl disable unattended-upgrades --now || true
+            - curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+            - apt-get install -y nodejs
+            - npm install -g pm2
+            - env PATH=$PATH:/usr/bin pm2 startup systemd -u root --hp /root
+            - systemctl enable pm2-root
+            - mkdir -p /opt/ltm-workshop
+            - chown azureuser:azureuser /opt/ltm-workshop
+          CLOUDINIT
+
           # App VM in Spoke VNet (web-snet) — workload tier
           # SSH access: Bastion (Hub) → via VNet Peering → VM (Spoke)
           az vm create \
@@ -411,6 +426,7 @@ jobs:
             --subnet ${{ env.WEB_SUBNET }} \
             --nsg "" \
             --public-ip-sku Standard \
+            --custom-data /tmp/cloud-init.yaml \
             --tags Project=LTM-SA-Workshop VM=primary VNet=Spoke
 
           VM1_IP=$(az vm show \
@@ -443,11 +459,27 @@ jobs:
       - name: Deploy lb-vm2.bicep (Spoke web-snet)
         id: bicep
         run: |
+          # Same cloud-init as VM-1: Node.js + pm2 pre-installed at VM-2 boot
+          cat > /tmp/cloud-init.yaml << 'CLOUDINIT'
+          #cloud-config
+          runcmd:
+            - systemctl disable unattended-upgrades --now || true
+            - curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+            - apt-get install -y nodejs
+            - npm install -g pm2
+            - env PATH=$PATH:/usr/bin pm2 startup systemd -u root --hp /root
+            - systemctl enable pm2-root
+            - mkdir -p /opt/ltm-workshop
+            - chown azureuser:azureuser /opt/ltm-workshop
+          CLOUDINIT
+          CUSTOM_DATA_B64=$(base64 -w0 /tmp/cloud-init.yaml)
+
           RESULT=$(az deployment group create \
             --resource-group ${{ env.AZURE_RG }} \
             --template-file bicep/lb-vm2.bicep \
             --parameters adminPassword="${{ secrets.ADMIN_PASSWORD }}" \
                          subnetId="${{ needs.setup-network.outputs.spoke_subnet_id }}" \
+                         customData="$CUSTOM_DATA_B64" \
             --query properties.outputs \
             --output json)
 
@@ -527,25 +559,10 @@ jobs:
             --command-id RunShellScript \
             --scripts "
               set -e
-              # Stop timer units first so they cannot re-trigger apt while we work
-              sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-              sudo systemctl stop unattended-upgrades apt-daily apt-daily-upgrade 2>/dev/null || true
-              sudo systemctl disable unattended-upgrades 2>/dev/null || true
-              # Force-kill any in-flight apt/dpkg processes (systemctl stop may not kill them)
-              sudo pkill -9 -f 'unattended-upgrade|apt-get|dpkg' 2>/dev/null || true
-              sleep 2
-              # Remove stale lock files left by killed processes
-              sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
-                         /var/lib/apt/lists/lock /var/cache/apt/archives/lock
-              sudo dpkg --configure -a 2>/dev/null || true
-              sudo apt-get -o DPkg::Lock::Timeout=60 update -qq 2>/dev/null || true
-              if ! command -v node &>/dev/null; then
-                curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - >/dev/null
-                sudo apt-get -o DPkg::Lock::Timeout=120 install -y nodejs >/dev/null
-              fi
-              if ! command -v pm2 &>/dev/null; then
-                sudo npm install -g pm2 >/dev/null 2>&1
-              fi
+              # Node.js + pm2 pre-installed by cloud-init at VM boot — no apt needed here
+              # Wait for cloud-init to finish (covers the case where VM just booted)
+              sudo cloud-init status --wait 2>/dev/null || true
+              echo 'cloud-init done. Node:' \$(node --version) 'pm2:' \$(pm2 --version)
               sudo mkdir -p ${APP_DIR}
               sudo chown azureuser:azureuser ${APP_DIR}
               cd ${APP_DIR}
@@ -559,12 +576,7 @@ jobs:
                   pm2 start app.js --name ltm-workshop
               fi
               pm2 save --force >/dev/null
-              # Register pm2 as systemd service — persists across run-command process group exit
-              PM2_BIN=\$(command -v pm2 2>/dev/null || echo /usr/lib/node_modules/pm2/bin/pm2)
-              env PATH=\$PATH:/usr/bin \$PM2_BIN startup systemd -u root --hp /root >/dev/null 2>&1 || true
-              systemctl daemon-reload >/dev/null 2>&1 || true
-              systemctl enable pm2-root >/dev/null 2>&1 || true
-              systemctl restart pm2-root >/dev/null 2>&1 || true
+              systemctl restart pm2-root 2>/dev/null || true
               for i in \$(seq 1 6); do
                 sleep 5
                 if curl -sf --max-time 10 http://localhost:${APP_PORT}/health >/dev/null; then
